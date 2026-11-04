@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.20)
+project(guest_le_checks C)
+enable_testing()
+add_executable(guest_le_test test_main.c checks.c)
+target_include_directories(guest_le_test PRIVATE ../../src)
+set_property(TARGET guest_le_test PROPERTY C_STANDARD 11)
+add_test(NAME guest_le COMMAND guest_le_test)

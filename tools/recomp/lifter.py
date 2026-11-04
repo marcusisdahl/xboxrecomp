@@ -1369,7 +1369,7 @@ class Lifter:
     def __init__(self, func_db=None, label_db=None, abi_db=None, xbe_data=None,
                  seh_prolog=None, seh_epilog=None,
                  setjmp_fn=None, longjmp_fn=None, manual_functions=None,
-                 wrapped_functions=None):
+                 wrapped_functions=None, explicit_guest_bus=False):
         """
         func_db: dict of func_addr → func_info (for naming call targets)
         label_db: dict of addr → name (for kernel imports, etc.)
@@ -1384,6 +1384,7 @@ class Lifter:
         self.label_db = label_db or {}
         self.abi_db = abi_db or {}
         self.xbe_data = xbe_data
+        self.explicit_guest_bus = explicit_guest_bus
         self.manual_functions = set(manual_functions or ())
         self.wrapped_functions = set(wrapped_functions or ())
         self._fp_top = 0  # FPU stack top index
@@ -1899,11 +1900,22 @@ class Lifter:
             if width == 4 and ops[0].type == "mem":
                 addr = _fmt_mem(ops[0])
                 src = _fmt_operand_read(ops[1])
+                # Explicit guest bus: guest addresses, not host pointers. The
+                # runtime routes these to xr_guest_atomic_*, which keep guest
+                # (little-endian) byte order on a big-endian host.
+                if self.explicit_guest_bus:
+                    add_fn, cas_fn, target = ("RECOMP_GUEST_ATOMIC_ADD32",
+                                              "RECOMP_GUEST_ATOMIC_CAS32",
+                                              f"(uint32_t)({addr})")
+                else:
+                    add_fn, cas_fn, target = ("RECOMP_ATOMIC_ADD32",
+                                              "RECOMP_ATOMIC_CAS32",
+                                              f"XBOX_PTR({addr})")
                 if atomic_m == "xadd":
                     # dst = dst + src, and src receives dst's old value.
                     return [
-                        "{ uint32_t _old = RECOMP_ATOMIC_ADD32("
-                        f"XBOX_PTR({addr}), {src});",
+                        f"{{ uint32_t _old = {add_fn}("
+                        f"{target}, {src});",
                         "  " + _fmt_operand_write(ops[1], "_old") + " }"
                         f"  /* {m} */",
                     ]
@@ -1914,8 +1926,8 @@ class Lifter:
                 # the wrong pair.
                 return [
                     "{ uint32_t _cmp = eax;",
-                    "  uint32_t _old = RECOMP_ATOMIC_CAS32("
-                    f"XBOX_PTR({addr}), _cmp, {src});",
+                    f"  uint32_t _old = {cas_fn}("
+                    f"{target}, _cmp, {src});",
                     "  _fa = _old; _fb = _cmp;",
                     "  _fas = (int32_t)_fa; _fbs = (int32_t)_fb;",
                     "  if (_old != _cmp) eax = _old; }"
@@ -2943,6 +2955,12 @@ class Lifter:
         #
         # memcpy is still used when the ranges provably do not overlap, which
         # is the overwhelming majority of calls.
+        if self.explicit_guest_bus and any(op in m for op in ("movsb", "movsw", "movsd", "stosb", "stosw", "stosd")):
+            width = 1 if m.endswith("b") else 2 if m.endswith("w") else 4
+            value = f"MEM{width * 8}(esi)" if "movs" in m else "eax"
+            source_step = " esi += _step;" if "movs" in m else ""
+            return [f"{{ int32_t _step = RECOMP_DF_STEP({width}); while (ecx) {{ "
+                    f"MEM{width * 8}(edi) = {value};{source_step} edi += _step; --ecx; }} }}"]
         if "movsb" in m:
             return ["if (!g_df) { uint8_t *_d = (uint8_t*)XBOX_PTR(edi),"
                     " *_s = (uint8_t*)XBOX_PTR(esi); uint32_t _n = ecx;",

@@ -221,7 +221,14 @@ extern RECOMP_TLS uint32_t g_seh_ebp;
  * now run on real host threads, so a read-modify-write that races is exactly
  * the bug these instructions exist to prevent.
  */
-#if defined(_MSC_VER)
+#if defined(RECOMP_EXPLICIT_GUEST_BUS)
+/* The old macros receive host pointers. They must not run against guest
+ * addresses on the explicit bus. The port must emit guest-address atomics. */
+#define RECOMP_ATOMIC_ADD32(p, v) XR_PORT_GUEST_ATOMIC_ADD_REQUIRED()
+#define RECOMP_ATOMIC_CAS32(p, cmp, val) XR_PORT_GUEST_ATOMIC_CAS_REQUIRED()
+/* Guest-address forms the lifter emits in explicit mode. Defined after the
+ * guest-reference facade below (they need xr_guest_require). */
+#elif defined(_MSC_VER)
 #include <intrin.h>
 #define RECOMP_ATOMIC_ADD32(p, v)     ((uint32_t)_InterlockedExchangeAdd((volatile long *)(p), (long)(v)))
 #define RECOMP_ATOMIC_CAS32(p, cmp, val)     ((uint32_t)_InterlockedCompareExchange((volatile long *)(p),                                            (long)(val), (long)(cmp)))
@@ -604,9 +611,36 @@ void recomp_trace_esp(const char *name, const char *tag);
  * uintptr_t cast preserves the overflow bits, landing us 4GB+ past
  * our mapping and causing access violations.
  */
+#if defined(RECOMP_EXPLICIT_GUEST_BUS)
+#define XBOX_PTR(addr) XR_RAW_GUEST_POINTER_REQUIRES_PORTING(addr)
+#else
 #define XBOX_PTR(addr) ((uintptr_t)(uint32_t)(addr) + g_xbox_mem_offset)
+#endif
 
 /** Read/write N bytes at a flat Xbox memory address. */
+#if defined(RECOMP_EXPLICIT_GUEST_BUS)
+#include "platform/recomp_guest_ref.h"
+#define MEM8(addr) XR_MEM8(addr)
+#define MEM16(addr) XR_MEM16(addr)
+#define MEM32(addr) XR_MEM32(addr)
+#define SMEM8(addr) XR_SMEM8(addr)
+#define SMEM16(addr) XR_SMEM16(addr)
+#define SMEM32(addr) XR_SMEM32(addr)
+#define SMEM64(addr) XR_SMEM64(addr)
+#define MEMF(addr) XR_MEMF(addr)
+#define MEMD(addr) XR_MEMD(addr)
+#include "platform/recomp_guest_atomic_win.h"
+static inline uint32_t RECOMP_GUEST_ATOMIC_ADD32(uint32_t va, uint32_t v) {
+    uint32_t old = 0;
+    xr_guest_require(xr_guest_atomic_add32(g_recomp_guest_bus, va, v, &old), va, 4);
+    return old;
+}
+static inline uint32_t RECOMP_GUEST_ATOMIC_CAS32(uint32_t va, uint32_t cmp, uint32_t val) {
+    uint32_t old = 0;
+    xr_guest_require(xr_guest_atomic_cas32(g_recomp_guest_bus, va, cmp, val, &old), va, 4);
+    return old;
+}
+#else
 #define MEM8(addr)   (*(volatile uint8_t  *)XBOX_PTR(addr))
 #define MEM16(addr)  (*(volatile uint16_t *)XBOX_PTR(addr))
 #define MEM32(addr)  (*(volatile uint32_t *)XBOX_PTR(addr))
@@ -620,6 +654,7 @@ void recomp_trace_esp(const char *name, const char *tag);
 /** Float/double memory access. */
 #define MEMF(addr)   (*(volatile float    *)XBOX_PTR(addr))
 #define MEMD(addr)   (*(volatile double   *)XBOX_PTR(addr))
+#endif
 
 /** Device registers at a constant address, by call instead of by fault.
  *
@@ -1366,12 +1401,20 @@ static inline RecompXmm XMM_FROM_PI(RecompXmm dst, RecompMmx src)
 
 static inline RecompMmx MMX_MEM(uint32_t addr) {
     RecompMmx r;
+#if defined(RECOMP_EXPLICIT_GUEST_BUS)
+    r.q = XrGuestRef<uint64_t>(addr);
+#else
     memcpy(&r, (const void *)XBOX_PTR(addr), 8);
+#endif
     return r;
 }
 
 static inline void MMX_STORE(uint32_t addr, RecompMmx v) {
+#if defined(RECOMP_EXPLICIT_GUEST_BUS)
+    (XrGuestRef<uint64_t>(addr)) = v.q;
+#else
     memcpy((void *)XBOX_PTR(addr), &v, 8);
+#endif
 }
 
 static inline RecompMmx MMX_FROM32(uint32_t v) {

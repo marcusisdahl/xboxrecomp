@@ -281,6 +281,12 @@ def main():
                              "patches.json to -o. Without it the output is "
                              "unchanged")
 
+    parser.add_argument("--explicit-guest-bus", action="store_true",
+                        help="Experimental portable guest-memory mode: use checked "
+                             "scalar lvalues and elementwise REP operations. "
+                             "Requires C++ and an explicit guest-bus host; "
+                             "does not provide a complete big-endian runtime")
+
     args = parser.parse_args()
 
     patches = None
@@ -367,6 +373,7 @@ def main():
             "icall_sites.json"),
         spin_waits=spin_waits,
         patches=patches,
+        explicit_guest_bus=args.explicit_guest_bus,
     )
     translator.observed_seeds = _load_observed_seeds(args.seeds)
 

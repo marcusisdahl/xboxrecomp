@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.20)
+project(guest_bus_checks C)
+enable_testing()
+add_executable(guest_bus_test test_main.c bus_checks.c ../../src/platform/recomp_guest_bus.c)
+target_include_directories(guest_bus_test PRIVATE ../../src)
+set_property(TARGET guest_bus_test PROPERTY C_STANDARD 11)
+add_test(NAME guest_bus COMMAND guest_bus_test)

@@ -126,6 +126,21 @@ def _incoming_flag_state(sources, known, is_entry):
     return _merge_flag_states([known[p] for p in sources])
 
 
+
+# Lines that switch a generated translation unit to the explicit guest-bus
+# memory model. They must come before recomp_types.h is parsed: that header is
+# include-guarded, so defining the mode after an earlier include would silently
+# leave the desktop raw-pointer macros in force. Tolerates the same mode given
+# on the compiler command line (-D/ /D) without a redefinition warning.
+EXPLICIT_GUEST_BUS_PROLOGUE = [
+    "#ifndef RECOMP_EXPLICIT_GUEST_BUS",
+    "#ifdef RECOMP_TYPES_H",
+    "#error recomp_types.h was included before explicit guest-bus mode was enabled",
+    "#endif",
+    "#define RECOMP_EXPLICIT_GUEST_BUS 1",
+    "#endif",
+]
+
 def write_if_changed(path, text):
     """Write text to path only when it differs from what is already there.
 
@@ -389,7 +404,8 @@ class FunctionTranslator:
     def __init__(self, xbe_data, func_db, label_db=None, classification_db=None,
                  abi_db=None, seh_prolog=None, seh_epilog=None,
                  setjmp_fn=None, longjmp_fn=None,
-                 trace_functions=None, force_returns=None, icall_sites=None):
+                 trace_functions=None, force_returns=None, icall_sites=None,
+                 explicit_guest_bus=False):
         """
         xbe_data: bytes - raw XBE file contents
         icall_sites: dict - call-site VA -> [target VAs] a recorded run saw
@@ -412,7 +428,8 @@ class FunctionTranslator:
         self.lifter = Lifter(func_db=func_db, label_db=label_db, abi_db=abi_db,
                              xbe_data=xbe_data, seh_prolog=seh_prolog,
                              setjmp_fn=setjmp_fn, longjmp_fn=longjmp_fn,
-                             seh_epilog=seh_epilog)
+                             seh_epilog=seh_epilog,
+                             explicit_guest_bus=explicit_guest_bus)
         self.owned_function_starts = set()
         self.recovered_function_starts = set()
         self.coalesced_function_starts = set()
@@ -2519,10 +2536,12 @@ class BatchTranslator:
                  output_dir=None, seh_prolog=None, seh_epilog=None,
                  trace_functions=None, force_returns=None,
                  coalesce_json_paths=None, protected_function_starts=None,
-                 icall_sites_json_path=None, spin_waits=None, patches=None):
+                 icall_sites_json_path=None, spin_waits=None, patches=None,
+                 explicit_guest_bus=False):
         """spin_waits: a spin_waits.SpinWaitConfig (--spin-waits), or None.
         patches: a patches.PatchConfig (--patches), or None."""
         self.xbe_path = xbe_path
+        self.explicit_guest_bus = explicit_guest_bus
         # Starts of the seeds a run saw (--seeds, `"observed": true`): the
         # flag-fallback report names its sites in these functions.
         self.observed_seeds = set()
@@ -2584,7 +2603,8 @@ class BatchTranslator:
             self.classification_db, self.abi_db,
             seh_prolog=0, seh_epilog=0,
             trace_functions=trace_functions,
-            force_returns=force_returns, icall_sites=self.icall_sites)
+            force_returns=force_returns, icall_sites=self.icall_sites,
+            explicit_guest_bus=explicit_guest_bus)
         if spin_waits is not None:
             from .spin_waits import SpinWaitReport
             self.translator.spin_waits = SpinWaitReport(spin_waits)
@@ -2709,6 +2729,8 @@ class BatchTranslator:
         c_chunks.append(" */")
         c_chunks.append("")
         c_chunks.append('#define RECOMP_GENERATED_CODE')
+        if getattr(self, "explicit_guest_bus", False):
+            c_chunks.extend(EXPLICIT_GUEST_BUS_PROLOGUE)
         c_chunks.append('#include "recomp_types.h"')
         c_chunks.append('#include <math.h>')
         c_chunks.append("")
@@ -2905,6 +2927,9 @@ class BatchTranslator:
             '#include "recomp_types.h"',
             "",
         ]
+        if getattr(self, "explicit_guest_bus", False):
+            at = header_lines.index('#include "recomp_types.h"')
+            header_lines[at:at] = EXPLICIT_GUEST_BUS_PROLOGUE
         for addr, name, _ in translations:
             decl = self._make_declaration(addr, name)
             header_lines.append(f"{decl};")
