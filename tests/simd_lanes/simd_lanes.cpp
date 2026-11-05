@@ -121,6 +121,12 @@ R_MMX2(MMX_PAND) R_MMX2(MMX_PANDN) R_MMX2(MMX_POR) R_MMX2(MMX_PXOR)
 R_MMXSH(MMX_PSLLW) R_MMXSH(MMX_PSRLW) R_MMXSH(MMX_PSRAW)
 R_MMXSH(MMX_PSLLD) R_MMXSH(MMX_PSRLD) R_MMXSH(MMX_PSRAD)
 R_MMXSH(MMX_PSLLQ) R_MMXSH(MMX_PSRLQ)
+/* Literal shift counts, as generated code passes them (mm0 = MMX_PSRAW(mm0, 4u)):
+ * the compiler folds the count into the lane masks, which runtime counts
+ * never exercise. */
+#define R_SHK(H, K) static void r_##H##_K##K(const Ctx *) { MMX_STORE(VA_OUT, H(MMXA, K##u)); }
+#define R_SHK7(H) R_SHK(H, 1) R_SHK(H, 2) R_SHK(H, 4) R_SHK(H, 8) R_SHK(H, 15) R_SHK(H, 16) R_SHK(H, 31)
+R_SHK7(MMX_PSLLW) R_SHK7(MMX_PSRLW) R_SHK7(MMX_PSRAW) R_SHK7(MMX_PSLLD) R_SHK7(MMX_PSRLD) R_SHK7(MMX_PSRAD) R_SHK7(MMX_PSLLQ) R_SHK7(MMX_PSRLQ)
 
 static void r_MMX_ZERO(const Ctx *) { MMX_STORE(VA_OUT, MMX_ZERO()); }
 static void r_MOVQ_LOAD_STORE(const Ctx *c) { MMX_STORE(VA_OUT, MMX_MEM(VA_A + (c->imm & 7u))); }
@@ -244,6 +250,9 @@ F_MMX2(MMX_POR, _mm_or_si64) F_MMX2(MMX_PXOR, _mm_xor_si64)
 F_MMXSH(MMX_PSLLW, _mm_sll_pi16) F_MMXSH(MMX_PSRLW, _mm_srl_pi16) F_MMXSH(MMX_PSRAW, _mm_sra_pi16)
 F_MMXSH(MMX_PSLLD, _mm_sll_pi32) F_MMXSH(MMX_PSRLD, _mm_srl_pi32) F_MMXSH(MMX_PSRAD, _mm_sra_pi32)
 F_MMXSH(MMX_PSLLQ, _mm_sll_si64) F_MMXSH(MMX_PSRLQ, _mm_srl_si64)
+#define F_SHK(H, I, K) static void f_##H##_K##K(Ctx *c) { put64(c, I(m64(c->in), K)); }
+#define F_SHK7(H, I) F_SHK(H, I, 1) F_SHK(H, I, 2) F_SHK(H, I, 4) F_SHK(H, I, 8)     F_SHK(H, I, 15) F_SHK(H, I, 16) F_SHK(H, I, 31)
+F_SHK7(MMX_PSLLW, _mm_slli_pi16) F_SHK7(MMX_PSRLW, _mm_srli_pi16) F_SHK7(MMX_PSRAW, _mm_srai_pi16) F_SHK7(MMX_PSLLD, _mm_slli_pi32) F_SHK7(MMX_PSRLD, _mm_srli_pi32) F_SHK7(MMX_PSRAD, _mm_srai_pi32) F_SHK7(MMX_PSLLQ, _mm_slli_si64) F_SHK7(MMX_PSRLQ, _mm_srli_si64)
 
 #define SW4(F, n) F(n) F((n) + 1) F((n) + 2) F((n) + 3)
 #define SW16(F, n) SW4(F, n) SW4(F, (n) + 4) SW4(F, (n) + 8) SW4(F, (n) + 12)
@@ -385,6 +394,8 @@ struct Case {
 #define C_MMX(H) { #H, IN_INT, IN_INT, IN_INT, OUT_INT, r_##H, REF(H) },
 #define C_SH(H) { #H, IN_INT, IN_INT, IN_CNT, OUT_INT, r_##H, REF(H) }, \
                 { #H "_IMM", IN_INT, IN_INT, IN_INT, OUT_INT, r_##H##_I, REF(H##_I) },
+#define C_SHK(H, K) { #H "_K" #K, IN_INT, IN_INT, IN_INT, OUT_INT, r_##H##_K##K, REF(H##_K##K) },
+#define C_SHK7(H) C_SHK(H, 1) C_SHK(H, 2) C_SHK(H, 4) C_SHK(H, 8) C_SHK(H, 15) C_SHK(H, 16) C_SHK(H, 31)
 #define C_XF(H) { #H, IN_FLT, IN_FLT, IN_FLT, OUT_FLT, r_##H, REF(H) },
 #define C_XI(H) { #H, IN_FLT, IN_FLT, IN_INT, OUT_INT, r_##H, REF(H) },
 #define C_NOREF(H, a, b, k) { #H, a, b, IN_INT, k, r_##H, 0 },
@@ -406,6 +417,7 @@ static const Case kCases[] = {
     C_SH(MMX_PSLLW) C_SH(MMX_PSRLW) C_SH(MMX_PSRAW)
     C_SH(MMX_PSLLD) C_SH(MMX_PSRLD) C_SH(MMX_PSRAD)
     C_SH(MMX_PSLLQ) C_SH(MMX_PSRLQ)
+    C_SHK7(MMX_PSLLW) C_SHK7(MMX_PSRLW) C_SHK7(MMX_PSRAW) C_SHK7(MMX_PSLLD) C_SHK7(MMX_PSRLD) C_SHK7(MMX_PSRAD) C_SHK7(MMX_PSLLQ) C_SHK7(MMX_PSRLQ)
     C_MMX(MMX_ZERO) C_MMX(MOVQ_LOAD_STORE) C_MMX(MOVD_TO_MM)
     C_MMX(MOVD_FROM_MM) C_MMX(MOVD_FROM_MM_GP)
     C_MMX(MMX_PSHUFW) C_MMX(MMX_PINSRW) C_MMX(MMX_PEXTRW) C_MMX(MMX_PMOVMSKB)

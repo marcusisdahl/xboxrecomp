@@ -1961,21 +1961,43 @@ RECOMP_MQ_FN RecompMmx MMX_POR(RecompMmx a, RecompMmx b)   { return recomp_mmx_q
 RECOMP_MQ_FN RecompMmx MMX_PXOR(RecompMmx a, RecompMmx b)  { return recomp_mmx_q(a.q ^ b.q); }
 
 /* -- shifts (counts as in the union versions above) -------------- */
+/* Lane shifts work on the two 32-bit halves with 32-bit masks. The Xbox 360
+ * compiler (2010-01) folds a 64-bit replicated mask such as
+ * (0xFFFFu >> 2) * 0x0001000100010001 into a wrong 64-bit constant (here
+ * 0xFFFF3FFF3FFF3FFF: the top lane's mask is built with lis -1), and it
+ * strength-reduces sign * 0xC000 with a 64-bit mask truncated to 32 bits.
+ * Generated code passes literal counts, so those folds happen in the game.
+ * 32-bit constants are materialised correctly. */
+RECOMP_MQ_FN uint64_t recomp_mq_join(uint32_t lo, uint32_t hi) {
+    return (uint64_t)lo | ((uint64_t)hi << 32);
+}
 RECOMP_MQ_FN RecompMmx MMX_PSLLW(RecompMmx a, uint64_t cnt) {
+    uint32_t lo = (uint32_t)a.q, hi = (uint32_t)(a.q >> 32), m;
+    unsigned c;
     if (cnt >= 16) return recomp_mmx_q(0);
-    return recomp_mmx_q((a.q << cnt) & ((uint64_t)(uint16_t)(0xFFFFu << cnt) * 0x0001000100010001ull));
+    c = (unsigned)cnt;
+    m = (0xFFFFu << c) & 0xFFFFu; m |= m << 16;
+    return recomp_mmx_q(recomp_mq_join((lo << c) & m, (hi << c) & m));
 }
 RECOMP_MQ_FN RecompMmx MMX_PSRLW(RecompMmx a, uint64_t cnt) {
+    uint32_t lo = (uint32_t)a.q, hi = (uint32_t)(a.q >> 32), m;
+    unsigned c;
     if (cnt >= 16) return recomp_mmx_q(0);
-    return recomp_mmx_q((a.q >> cnt) & ((uint64_t)(0xFFFFu >> cnt) * 0x0001000100010001ull));
+    c = (unsigned)cnt;
+    m = 0xFFFFu >> c; m |= m << 16;
+    return recomp_mmx_q(recomp_mq_join((lo >> c) & m, (hi >> c) & m));
 }
 RECOMP_MQ_FN RecompMmx MMX_PSLLD(RecompMmx a, uint64_t cnt) {
+    unsigned c;
     if (cnt >= 32) return recomp_mmx_q(0);
-    return recomp_mmx_q((a.q << cnt) & ((uint64_t)(uint32_t)(0xFFFFFFFFu << cnt) * 0x0000000100000001ull));
+    c = (unsigned)cnt;
+    return recomp_mmx_q(recomp_mq_join((uint32_t)a.q << c, (uint32_t)(a.q >> 32) << c));
 }
 RECOMP_MQ_FN RecompMmx MMX_PSRLD(RecompMmx a, uint64_t cnt) {
+    unsigned c;
     if (cnt >= 32) return recomp_mmx_q(0);
-    return recomp_mmx_q((a.q >> cnt) & ((uint64_t)(0xFFFFFFFFu >> cnt) * 0x0000000100000001ull));
+    c = (unsigned)cnt;
+    return recomp_mmx_q(recomp_mq_join((uint32_t)a.q >> c, (uint32_t)(a.q >> 32) >> c));
 }
 RECOMP_MQ_FN RecompMmx MMX_PSLLQ(RecompMmx a, uint64_t cnt) {
     return recomp_mmx_q((cnt >= 64) ? 0 : (a.q << cnt));
@@ -1983,11 +2005,20 @@ RECOMP_MQ_FN RecompMmx MMX_PSLLQ(RecompMmx a, uint64_t cnt) {
 RECOMP_MQ_FN RecompMmx MMX_PSRLQ(RecompMmx a, uint64_t cnt) {
     return recomp_mmx_q((cnt >= 64) ? 0 : (a.q >> cnt));
 }
+/* Two words per 32-bit half, all unsigned: the logical shift, then the
+ * sign fill (0xFFFF per negative lane, minus the kept bits). The per-lane
+ * (int16_t) cast form was also miscompiled on the 360 (0x8000 >> 15 gave
+ * 0x0001, the sign extension dropped). */
+RECOMP_MQ_FN uint32_t recomp_mq_sraw32(uint32_t x, unsigned c) {
+    uint32_t keep = 0xFFFFu >> c, neg;
+    keep |= keep << 16;
+    neg = ((x >> 15) & 1u) * 0xFFFFu | ((x >> 31) & 1u) * 0xFFFF0000u;
+    return ((x >> c) & keep) | (neg & ~keep);
+}
 RECOMP_MQ_FN RecompMmx MMX_PSRAW(RecompMmx a, uint64_t cnt) {
-    uint64_t acc = 0; int i; unsigned c = (unsigned)((cnt >= 16) ? 15 : cnt);
-    for (i = 0; i < 4; i++)
-        acc |= (uint64_t)(uint16_t)(RECOMP_MQ_S16(a.q, i) >> c) << (i * 16);
-    return recomp_mmx_q(acc);
+    unsigned c = (unsigned)((cnt >= 16) ? 15 : cnt);
+    return recomp_mmx_q(recomp_mq_join(recomp_mq_sraw32((uint32_t)a.q, c),
+                                       recomp_mq_sraw32((uint32_t)(a.q >> 32), c)));
 }
 RECOMP_MQ_FN RecompMmx MMX_PSRAD(RecompMmx a, uint64_t cnt) {
     unsigned c = (unsigned)((cnt >= 32) ? 31 : cnt);
