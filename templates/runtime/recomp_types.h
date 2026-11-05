@@ -1590,7 +1590,18 @@ static inline int32_t MMX_CVT_F2I(float v, int truncate)
 #define RECOMP_MQ_S16(q, i) ((int32_t)(int16_t)(uint16_t)((q) >> ((i) * 16)))
 #define RECOMP_MQ_U32(q, i) ((uint32_t)((q) >> ((i) * 32)))
 #define RECOMP_MQ_S32(q, i) ((int32_t)(uint32_t)((q) >> ((i) * 32)))
-static inline RecompMmx recomp_mmx_q(uint64_t q) { RecompMmx r; r.q = q; return r; }
+/* Forced inline: with plain `inline` the Xbox 360 compiler (2010-01) dies
+ * with C1001 on some of the XMV player's MMX functions (pxor of a register
+ * with itself feeding packuswb, in sub_002D16CF); inlined up front they
+ * compile, and they are a few instructions each anyway. */
+#if defined(_MSC_VER)
+#define RECOMP_MQ_FN static __forceinline
+#elif defined(__GNUC__)
+#define RECOMP_MQ_FN static inline __attribute__((always_inline))
+#else
+#define RECOMP_MQ_FN static inline
+#endif
+RECOMP_MQ_FN RecompMmx recomp_mmx_q(uint64_t q) { RecompMmx r; r.q = q; return r; }
 #endif
 
 static inline RecompMmx MMX_FROM_PS(float lo, float hi, int truncate)
@@ -1874,23 +1885,23 @@ static inline RecompMmx MMX_PSADBW(RecompMmx a, RecompMmx b) {
 #define RECOMP_MQ_H8  0x8080808080808080ull
 #define RECOMP_MQ_H16 0x8000800080008000ull
 #define RECOMP_MQ_H32 0x8000000080000000ull
-static inline uint64_t recomp_mq_add(uint64_t a, uint64_t b, uint64_t h) {
+RECOMP_MQ_FN uint64_t recomp_mq_add(uint64_t a, uint64_t b, uint64_t h) {
     return ((a & ~h) + (b & ~h)) ^ ((a ^ b) & h);
 }
-static inline uint64_t recomp_mq_sub(uint64_t a, uint64_t b, uint64_t h) {
+RECOMP_MQ_FN uint64_t recomp_mq_sub(uint64_t a, uint64_t b, uint64_t h) {
     return ((a | h) - (b & ~h)) ^ ((a ^ ~b) & h);
 }
-static inline RecompMmx MMX_PADDB(RecompMmx a, RecompMmx b) { return recomp_mmx_q(recomp_mq_add(a.q, b.q, RECOMP_MQ_H8)); }
-static inline RecompMmx MMX_PADDW(RecompMmx a, RecompMmx b) { return recomp_mmx_q(recomp_mq_add(a.q, b.q, RECOMP_MQ_H16)); }
-static inline RecompMmx MMX_PADDD(RecompMmx a, RecompMmx b) { return recomp_mmx_q(recomp_mq_add(a.q, b.q, RECOMP_MQ_H32)); }
-static inline RecompMmx MMX_PSUBB(RecompMmx a, RecompMmx b) { return recomp_mmx_q(recomp_mq_sub(a.q, b.q, RECOMP_MQ_H8)); }
-static inline RecompMmx MMX_PSUBW(RecompMmx a, RecompMmx b) { return recomp_mmx_q(recomp_mq_sub(a.q, b.q, RECOMP_MQ_H16)); }
-static inline RecompMmx MMX_PSUBD(RecompMmx a, RecompMmx b) { return recomp_mmx_q(recomp_mq_sub(a.q, b.q, RECOMP_MQ_H32)); }
+RECOMP_MQ_FN RecompMmx MMX_PADDB(RecompMmx a, RecompMmx b) { return recomp_mmx_q(recomp_mq_add(a.q, b.q, RECOMP_MQ_H8)); }
+RECOMP_MQ_FN RecompMmx MMX_PADDW(RecompMmx a, RecompMmx b) { return recomp_mmx_q(recomp_mq_add(a.q, b.q, RECOMP_MQ_H16)); }
+RECOMP_MQ_FN RecompMmx MMX_PADDD(RecompMmx a, RecompMmx b) { return recomp_mmx_q(recomp_mq_add(a.q, b.q, RECOMP_MQ_H32)); }
+RECOMP_MQ_FN RecompMmx MMX_PSUBB(RecompMmx a, RecompMmx b) { return recomp_mmx_q(recomp_mq_sub(a.q, b.q, RECOMP_MQ_H8)); }
+RECOMP_MQ_FN RecompMmx MMX_PSUBW(RecompMmx a, RecompMmx b) { return recomp_mmx_q(recomp_mq_sub(a.q, b.q, RECOMP_MQ_H16)); }
+RECOMP_MQ_FN RecompMmx MMX_PSUBD(RecompMmx a, RecompMmx b) { return recomp_mmx_q(recomp_mq_sub(a.q, b.q, RECOMP_MQ_H32)); }
 
 /* Lane-wise: GET reads lane i of a and b (RECOMP_MQ_*), EXPR is the lane's
  * result, masked to BITS and put back at lane i. */
 #define RECOMP_MQ_BINOP(NAME, LANES, BITS, EXPR)                        \
-    static inline RecompMmx NAME(RecompMmx a, RecompMmx b) {            \
+    RECOMP_MQ_FN RecompMmx NAME(RecompMmx a, RecompMmx b) {            \
         uint64_t acc = 0; int i;                                        \
         for (i = 0; i < (LANES); i++)                                   \
             acc |= ((uint64_t)((uint32_t)(EXPR) & (uint32_t)(0xFFFFFFFFu >> (32 - (BITS))))) << (i * (BITS)); \
@@ -1918,7 +1929,7 @@ RECOMP_MQ_BINOP(MMX_PCMPGTW, 4, 16, RECOMP_MQ_S16(a.q, i) > RECOMP_MQ_S16(b.q, i
 RECOMP_MQ_BINOP(MMX_PCMPGTD, 2, 32, RECOMP_MQ_S32(a.q, i) > RECOMP_MQ_S32(b.q, i) ? 0xFFFFFFFFu : 0u)
 
 /* pmaddwd: multiply signed words, add adjacent pairs into dwords. */
-static inline RecompMmx MMX_PMADDWD(RecompMmx a, RecompMmx b) {
+RECOMP_MQ_FN RecompMmx MMX_PMADDWD(RecompMmx a, RecompMmx b) {
     uint32_t lo = (uint32_t)(RECOMP_MQ_S16(a.q, 0) * RECOMP_MQ_S16(b.q, 0))
                 + (uint32_t)(RECOMP_MQ_S16(a.q, 1) * RECOMP_MQ_S16(b.q, 1));
     uint32_t hi = (uint32_t)(RECOMP_MQ_S16(a.q, 2) * RECOMP_MQ_S16(b.q, 2))
@@ -1927,41 +1938,41 @@ static inline RecompMmx MMX_PMADDWD(RecompMmx a, RecompMmx b) {
 }
 
 /* -- bitwise ---------------------------------------------------- */
-static inline RecompMmx MMX_PAND(RecompMmx a, RecompMmx b)  { return recomp_mmx_q(a.q & b.q); }
-static inline RecompMmx MMX_PANDN(RecompMmx a, RecompMmx b) { return recomp_mmx_q(~a.q & b.q); }
-static inline RecompMmx MMX_POR(RecompMmx a, RecompMmx b)   { return recomp_mmx_q(a.q | b.q); }
-static inline RecompMmx MMX_PXOR(RecompMmx a, RecompMmx b)  { return recomp_mmx_q(a.q ^ b.q); }
+RECOMP_MQ_FN RecompMmx MMX_PAND(RecompMmx a, RecompMmx b)  { return recomp_mmx_q(a.q & b.q); }
+RECOMP_MQ_FN RecompMmx MMX_PANDN(RecompMmx a, RecompMmx b) { return recomp_mmx_q(~a.q & b.q); }
+RECOMP_MQ_FN RecompMmx MMX_POR(RecompMmx a, RecompMmx b)   { return recomp_mmx_q(a.q | b.q); }
+RECOMP_MQ_FN RecompMmx MMX_PXOR(RecompMmx a, RecompMmx b)  { return recomp_mmx_q(a.q ^ b.q); }
 
 /* -- shifts (counts as in the union versions above) -------------- */
-static inline RecompMmx MMX_PSLLW(RecompMmx a, uint64_t cnt) {
+RECOMP_MQ_FN RecompMmx MMX_PSLLW(RecompMmx a, uint64_t cnt) {
     if (cnt >= 16) return recomp_mmx_q(0);
     return recomp_mmx_q((a.q << cnt) & ((uint64_t)(uint16_t)(0xFFFFu << cnt) * 0x0001000100010001ull));
 }
-static inline RecompMmx MMX_PSRLW(RecompMmx a, uint64_t cnt) {
+RECOMP_MQ_FN RecompMmx MMX_PSRLW(RecompMmx a, uint64_t cnt) {
     if (cnt >= 16) return recomp_mmx_q(0);
     return recomp_mmx_q((a.q >> cnt) & ((uint64_t)(0xFFFFu >> cnt) * 0x0001000100010001ull));
 }
-static inline RecompMmx MMX_PSLLD(RecompMmx a, uint64_t cnt) {
+RECOMP_MQ_FN RecompMmx MMX_PSLLD(RecompMmx a, uint64_t cnt) {
     if (cnt >= 32) return recomp_mmx_q(0);
     return recomp_mmx_q((a.q << cnt) & ((uint64_t)(uint32_t)(0xFFFFFFFFu << cnt) * 0x0000000100000001ull));
 }
-static inline RecompMmx MMX_PSRLD(RecompMmx a, uint64_t cnt) {
+RECOMP_MQ_FN RecompMmx MMX_PSRLD(RecompMmx a, uint64_t cnt) {
     if (cnt >= 32) return recomp_mmx_q(0);
     return recomp_mmx_q((a.q >> cnt) & ((uint64_t)(0xFFFFFFFFu >> cnt) * 0x0000000100000001ull));
 }
-static inline RecompMmx MMX_PSLLQ(RecompMmx a, uint64_t cnt) {
+RECOMP_MQ_FN RecompMmx MMX_PSLLQ(RecompMmx a, uint64_t cnt) {
     return recomp_mmx_q((cnt >= 64) ? 0 : (a.q << cnt));
 }
-static inline RecompMmx MMX_PSRLQ(RecompMmx a, uint64_t cnt) {
+RECOMP_MQ_FN RecompMmx MMX_PSRLQ(RecompMmx a, uint64_t cnt) {
     return recomp_mmx_q((cnt >= 64) ? 0 : (a.q >> cnt));
 }
-static inline RecompMmx MMX_PSRAW(RecompMmx a, uint64_t cnt) {
+RECOMP_MQ_FN RecompMmx MMX_PSRAW(RecompMmx a, uint64_t cnt) {
     uint64_t acc = 0; int i; unsigned c = (unsigned)((cnt >= 16) ? 15 : cnt);
     for (i = 0; i < 4; i++)
         acc |= (uint64_t)(uint16_t)(RECOMP_MQ_S16(a.q, i) >> c) << (i * 16);
     return recomp_mmx_q(acc);
 }
-static inline RecompMmx MMX_PSRAD(RecompMmx a, uint64_t cnt) {
+RECOMP_MQ_FN RecompMmx MMX_PSRAD(RecompMmx a, uint64_t cnt) {
     unsigned c = (unsigned)((cnt >= 32) ? 31 : cnt);
     return recomp_mmx_q((uint64_t)(uint32_t)(RECOMP_MQ_S32(a.q, 0) >> c)
                         | ((uint64_t)(uint32_t)(RECOMP_MQ_S32(a.q, 1) >> c) << 32));
@@ -1972,47 +1983,47 @@ static inline RecompMmx MMX_PSRAD(RecompMmx a, uint64_t cnt) {
  * the even lanes, y the odd ones. Built from 32-bit halves, which the Xbox
  * 360 compiler handles well (a 64-bit spread-and-mask form of the same thing
  * crashed it, C1001, in the XMV player's MMX code). */
-static inline uint64_t recomp_mq_ilv8(uint32_t x, uint32_t y) {
+RECOMP_MQ_FN uint64_t recomp_mq_ilv8(uint32_t x, uint32_t y) {
     uint32_t lo = (x & 0xFFu) | ((y & 0xFFu) << 8) | ((x & 0xFF00u) << 8) | ((y & 0xFF00u) << 16);
     uint32_t hi = ((x >> 16) & 0xFFu) | (((y >> 16) & 0xFFu) << 8) | ((x >> 8) & 0xFF0000u) | (y & 0xFF000000u);
     return (uint64_t)lo | ((uint64_t)hi << 32);
 }
-static inline uint64_t recomp_mq_ilv16(uint32_t x, uint32_t y) {
+RECOMP_MQ_FN uint64_t recomp_mq_ilv16(uint32_t x, uint32_t y) {
     uint32_t lo = (x & 0xFFFFu) | (y << 16);
     uint32_t hi = (x >> 16) | (y & 0xFFFF0000u);
     return (uint64_t)lo | ((uint64_t)hi << 32);
 }
-static inline RecompMmx MMX_PUNPCKLBW(RecompMmx a, RecompMmx b) {
+RECOMP_MQ_FN RecompMmx MMX_PUNPCKLBW(RecompMmx a, RecompMmx b) {
     return recomp_mmx_q(recomp_mq_ilv8((uint32_t)a.q, (uint32_t)b.q));
 }
-static inline RecompMmx MMX_PUNPCKHBW(RecompMmx a, RecompMmx b) {
+RECOMP_MQ_FN RecompMmx MMX_PUNPCKHBW(RecompMmx a, RecompMmx b) {
     return recomp_mmx_q(recomp_mq_ilv8((uint32_t)(a.q >> 32), (uint32_t)(b.q >> 32)));
 }
-static inline RecompMmx MMX_PUNPCKLWD(RecompMmx a, RecompMmx b) {
+RECOMP_MQ_FN RecompMmx MMX_PUNPCKLWD(RecompMmx a, RecompMmx b) {
     return recomp_mmx_q(recomp_mq_ilv16((uint32_t)a.q, (uint32_t)b.q));
 }
-static inline RecompMmx MMX_PUNPCKHWD(RecompMmx a, RecompMmx b) {
+RECOMP_MQ_FN RecompMmx MMX_PUNPCKHWD(RecompMmx a, RecompMmx b) {
     return recomp_mmx_q(recomp_mq_ilv16((uint32_t)(a.q >> 32), (uint32_t)(b.q >> 32)));
 }
-static inline RecompMmx MMX_PUNPCKLDQ(RecompMmx a, RecompMmx b) {
+RECOMP_MQ_FN RecompMmx MMX_PUNPCKLDQ(RecompMmx a, RecompMmx b) {
     return recomp_mmx_q((a.q & 0xFFFFFFFFull) | (b.q << 32));
 }
-static inline RecompMmx MMX_PUNPCKHDQ(RecompMmx a, RecompMmx b) {
+RECOMP_MQ_FN RecompMmx MMX_PUNPCKHDQ(RecompMmx a, RecompMmx b) {
     return recomp_mmx_q((a.q >> 32) | (b.q & 0xFFFFFFFF00000000ull));
 }
-static inline RecompMmx MMX_PACKSSWB(RecompMmx a, RecompMmx b) {
+RECOMP_MQ_FN RecompMmx MMX_PACKSSWB(RecompMmx a, RecompMmx b) {
     uint64_t acc = 0; int i;
     for (i = 0; i < 4; i++) acc |= (uint64_t)(uint8_t)recomp_sat_i8(RECOMP_MQ_S16(a.q, i)) << (i * 8);
     for (i = 0; i < 4; i++) acc |= (uint64_t)(uint8_t)recomp_sat_i8(RECOMP_MQ_S16(b.q, i)) << (i * 8 + 32);
     return recomp_mmx_q(acc);
 }
-static inline RecompMmx MMX_PACKUSWB(RecompMmx a, RecompMmx b) {
+RECOMP_MQ_FN RecompMmx MMX_PACKUSWB(RecompMmx a, RecompMmx b) {
     uint64_t acc = 0; int i;
     for (i = 0; i < 4; i++) acc |= (uint64_t)recomp_sat_u8(RECOMP_MQ_S16(a.q, i)) << (i * 8);
     for (i = 0; i < 4; i++) acc |= (uint64_t)recomp_sat_u8(RECOMP_MQ_S16(b.q, i)) << (i * 8 + 32);
     return recomp_mmx_q(acc);
 }
-static inline RecompMmx MMX_PACKSSDW(RecompMmx a, RecompMmx b) {
+RECOMP_MQ_FN RecompMmx MMX_PACKSSDW(RecompMmx a, RecompMmx b) {
     return recomp_mmx_q((uint64_t)(uint16_t)recomp_sat_i16(RECOMP_MQ_S32(a.q, 0))
                         | ((uint64_t)(uint16_t)recomp_sat_i16(RECOMP_MQ_S32(a.q, 1)) << 16)
                         | ((uint64_t)(uint16_t)recomp_sat_i16(RECOMP_MQ_S32(b.q, 0)) << 32)
@@ -2020,25 +2031,25 @@ static inline RecompMmx MMX_PACKSSDW(RecompMmx a, RecompMmx b) {
 }
 
 /* -- word insert / extract / shuffle ----------------------------- */
-static inline RecompMmx MMX_PSHUFW(RecompMmx a, uint32_t imm) {
+RECOMP_MQ_FN RecompMmx MMX_PSHUFW(RecompMmx a, uint32_t imm) {
     uint64_t acc = 0; int i;
     for (i = 0; i < 4; i++)
         acc |= (uint64_t)RECOMP_MQ_U16(a.q, (imm >> (i * 2)) & 3u) << (i * 16);
     return recomp_mmx_q(acc);
 }
-static inline RecompMmx MMX_PINSRW(RecompMmx a, uint32_t v, uint32_t imm) {
+RECOMP_MQ_FN RecompMmx MMX_PINSRW(RecompMmx a, uint32_t v, uint32_t imm) {
     unsigned s = (imm & 3u) * 16;
     return recomp_mmx_q((a.q & ~(0xFFFFull << s)) | ((uint64_t)(uint16_t)v << s));
 }
-static inline uint32_t MMX_PEXTRW(RecompMmx a, uint32_t imm) {
+RECOMP_MQ_FN uint32_t MMX_PEXTRW(RecompMmx a, uint32_t imm) {
     return RECOMP_MQ_U16(a.q, imm & 3u);
 }
-static inline uint32_t MMX_PMOVMSKB(RecompMmx a) {
+RECOMP_MQ_FN uint32_t MMX_PMOVMSKB(RecompMmx a) {
     uint32_t m = 0; int i;
     for (i = 0; i < 8; i++) m |= (uint32_t)((a.q >> (i * 8 + 7)) & 1u) << i;
     return m;
 }
-static inline RecompMmx MMX_PSADBW(RecompMmx a, RecompMmx b) {
+RECOMP_MQ_FN RecompMmx MMX_PSADBW(RecompMmx a, RecompMmx b) {
     int i; uint32_t s = 0;
     for (i = 0; i < 8; i++) {
         uint32_t x = RECOMP_MQ_U8(a.q, i), y = RECOMP_MQ_U8(b.q, i);
