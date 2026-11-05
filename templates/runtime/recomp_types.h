@@ -462,9 +462,41 @@ static inline int recomp_x87_fptan(double *st0, double *push, uint16_t *cc) {
  * follow from it. Same results as floor/ceil/trunc/fmod, except that
  * recomp_x87_round may return +0.0 where they give -0.0 (FIST cannot tell;
  * recomp_frndint restores the sign). */
+/* On the Xbox 360 the int64 round trips below are the expensive part: Xenon
+ * has no FPR-to-GPR move, so each (int64_t)/(double) pair is fctidz, stfd,
+ * ld, std, lfd, fcfid -- two load-hit-store stalls of about 40 cycles each,
+ * three or four per call. The XMV player's cvtps2pi (MMX_CVT_F2I) spent a
+ * quarter of the guest thread here. __fctidz/__fcfid keep the integer in the
+ * FPR, and the parity test for ties is done there too (lo/2 is exact; it is
+ * integral exactly when lo is even), so the whole rounding stays in FPRs and
+ * never depends on the host FPSCR rounding mode. Checked by the console lane
+ * test (cvtps2pi/cvttps2pi cases include exact ties and out-of-range values). */
+#if defined(_XBOX) && !defined(_M_IX86) && !defined(_M_X64)
+#define RECOMP_X87_ROUND_FPR 1
+#include <ppcintrinsics.h>
+#else
+#define RECOMP_X87_ROUND_FPR 0
+#endif
 static inline double recomp_x87_round(double value, uint16_t control) {
     double t, lo, fraction;
     if (!(fabs(value) < 4503599627370496.0)) return value;   /* 2^52, inf, NaN */
+#if RECOMP_X87_ROUND_FPR
+    t = __fcfid(__fctidz(value));                             /* toward zero */
+    switch ((control >> 10) & 3) {
+    case 1: return t > value ? t - 1.0 : t;                   /* down */
+    case 2: return t < value ? t + 1.0 : t;                   /* up */
+    case 3: return t;                                         /* chop */
+    default: {                                                /* nearest-even */
+        double half;
+        lo = t > value ? t - 1.0 : t;
+        fraction = value - lo;
+        if (fraction > 0.5) return lo + 1.0;
+        if (fraction < 0.5) return lo;
+        half = lo * 0.5;
+        return half != __fcfid(__fctidz(half)) ? lo + 1.0 : lo;   /* lo odd */
+    }
+    }
+#endif
     t = (double)(int64_t)value;                               /* toward zero */
     switch ((control >> 10) & 3) {
     case 1: return t > value ? t - 1.0 : t;                   /* down */
