@@ -703,6 +703,72 @@ typedef union RecompXmm {
 } RecompXmm;
 #endif
 
+/* Host byte order, for the register unions below and in the MMX file.
+ *
+ * The guest is little-endian and its memory stays little-endian on every
+ * host (the explicit guest bus converts each scalar access). The register
+ * unions are host objects, though, and a union's narrower views only line up
+ * with the guest's lane numbering when the host is little-endian too: on the
+ * Xbox 360 (big-endian PowerPC) byte 0 of a uint64_t is its MOST significant
+ * byte, so `mm.ub[0]` is x86 byte lane 7 and `mm.ud[0]` is the high dword.
+ * Every helper that moved data between lanes -- punpck*, pack*, pshufw,
+ * psadbw, movd out of an mm register -- then moved the wrong lanes, and the
+ * XMV decoder's MMX IDCT painted the intro movies as black-and-white noise
+ * while the little-endian build of the same code showed them correctly.
+ *
+ * Set RECOMP_HOST_BIG_ENDIAN explicitly to override the detection. */
+#ifndef RECOMP_HOST_BIG_ENDIAN
+#  if defined(_M_PPC) || defined(_M_PPCBE) || defined(__BIG_ENDIAN__) || \
+      defined(__ARMEB__) || defined(__MIPSEB__) || \
+      (defined(__BYTE_ORDER__) && defined(__ORDER_BIG_ENDIAN__) && \
+       __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__) || \
+      (defined(_XBOX) && !defined(_M_IX86) && !defined(_M_X64))
+#    define RECOMP_HOST_BIG_ENDIAN 1
+#  else
+#    define RECOMP_HOST_BIG_ENDIAN 0
+#  endif
+#endif
+
+/* XMM lane invariant: f[k], u[k] and i[k] are x86 dword lane k on every host
+ * (each is one whole 32-bit element, so host byte order never splits one),
+ * and XMM_MEM/XMM_STORE move the register dword by dword through MEM32. The
+ * 64-bit views q[k] and d[k] are NOT x86 qword lane k on a big-endian host --
+ * there q[0] holds lane 0 in its high half -- so they may only be used to copy
+ * or clear a half as raw storage. Anything that reads or writes a 64-bit lane
+ * as a number goes through these accessors, which are the plain union access
+ * on a little-endian host. */
+static inline uint64_t XMM_GET_Q(RecompXmm r, int k) {
+#if RECOMP_HOST_BIG_ENDIAN
+    return (uint64_t)r.u[k * 2] | ((uint64_t)r.u[k * 2 + 1] << 32);
+#else
+    return r.q[k];
+#endif
+}
+static inline void XMM_SET_Q(RecompXmm *r, int k, uint64_t v) {
+#if RECOMP_HOST_BIG_ENDIAN
+    r->u[k * 2] = (uint32_t)v; r->u[k * 2 + 1] = (uint32_t)(v >> 32);
+#else
+    r->q[k] = v;
+#endif
+}
+static inline double XMM_GET_D(RecompXmm r, int k) {
+#if RECOMP_HOST_BIG_ENDIAN
+    uint64_t bits = XMM_GET_Q(r, k); double v;
+    memcpy(&v, &bits, sizeof v);
+    return v;
+#else
+    return r.d[k];
+#endif
+}
+static inline void XMM_SET_D(RecompXmm *r, int k, double v) {
+#if RECOMP_HOST_BIG_ENDIAN
+    uint64_t bits; memcpy(&bits, &v, sizeof bits);
+    XMM_SET_Q(r, k, bits);
+#else
+    r->d[k] = v;
+#endif
+}
+
 extern RECOMP_TLS RecompXmm g_xmm0, g_xmm1, g_xmm2, g_xmm3;
 extern RECOMP_TLS RecompXmm g_xmm4, g_xmm5, g_xmm6, g_xmm7;
 
@@ -719,7 +785,7 @@ static inline RecompXmm XMM_SCALAR(float v) {
 
 /** movsd from memory: low double set, high double zeroed. */
 static inline RecompXmm XMM_SCALAR_DOUBLE(double v) {
-    RecompXmm r = XMM_ZERO(); r.d[0] = v; return r;
+    RecompXmm r = XMM_ZERO(); XMM_SET_D(&r, 0, v); return r;
 }
 
 /** movd: 32 raw bits into lane 0, upper lanes zeroed. */
@@ -1362,6 +1428,26 @@ typedef union RecompMmx {
 extern RECOMP_TLS RecompMmx g_mm0, g_mm1, g_mm2, g_mm3;
 extern RECOMP_TLS RecompMmx g_mm4, g_mm5, g_mm6, g_mm7;
 
+/* MMX lane invariant: `q` is the register's 64-bit value as x86 sees it
+ * (bit 0 is bit 0 of byte lane 0), on every host. MMX_MEM/MMX_STORE move q
+ * through a 64-bit little-endian guest access, and psllq/psrlq/pand/... work
+ * on q directly. The narrower views are reached ONLY through these macros,
+ * which turn an x86 lane number into the union index holding that lane: the
+ * same index on a little-endian host, the mirrored one on a big-endian host
+ * (see RECOMP_HOST_BIG_ENDIAN above). Generated code uses them too -- movd
+ * out of an mm register is RECOMP_MMX_UD(mmN, 0), never mmN.ud[0]. */
+#if RECOMP_HOST_BIG_ENDIAN
+#define RECOMP_MMX_IX(lanes, i) ((lanes) - 1 - (i))
+#else
+#define RECOMP_MMX_IX(lanes, i) (i)
+#endif
+#define RECOMP_MMX_B(r, i)  ((r).b[RECOMP_MMX_IX(8, (i))])
+#define RECOMP_MMX_UB(r, i) ((r).ub[RECOMP_MMX_IX(8, (i))])
+#define RECOMP_MMX_W(r, i)  ((r).w[RECOMP_MMX_IX(4, (i))])
+#define RECOMP_MMX_UW(r, i) ((r).uw[RECOMP_MMX_IX(4, (i))])
+#define RECOMP_MMX_D(r, i)  ((r).d[RECOMP_MMX_IX(2, (i))])
+#define RECOMP_MMX_UD(r, i) ((r).ud[RECOMP_MMX_IX(2, (i))])
+
 static inline RecompMmx MMX_ZERO(void) { RecompMmx r; r.q = 0; return r; }
 
 /* CVTPS2PI follows MXCSR; CVTTPS2PI truncates regardless of its rounding mode.
@@ -1383,8 +1469,8 @@ static inline int32_t MMX_CVT_F2I(float v, int truncate)
 static inline RecompMmx MMX_FROM_PS(float lo, float hi, int truncate)
 {
     RecompMmx r;
-    r.d[0] = MMX_CVT_F2I(lo, truncate);
-    r.d[1] = MMX_CVT_F2I(hi, truncate);
+    RECOMP_MMX_D(r, 0) = MMX_CVT_F2I(lo, truncate);
+    RECOMP_MMX_D(r, 1) = MMX_CVT_F2I(hi, truncate);
     return r;
 }
 
@@ -1394,8 +1480,8 @@ static inline RecompMmx MMX_FROM_PS(float lo, float hi, int truncate)
  * the first one surviving the second. */
 static inline RecompXmm XMM_FROM_PI(RecompXmm dst, RecompMmx src)
 {
-    dst.f[0] = (float)src.d[0];
-    dst.f[1] = (float)src.d[1];
+    dst.f[0] = (float)RECOMP_MMX_D(src, 0);
+    dst.f[1] = (float)RECOMP_MMX_D(src, 1);
     return dst;
 }
 
@@ -1417,8 +1503,9 @@ static inline void MMX_STORE(uint32_t addr, RecompMmx v) {
 #endif
 }
 
+/** movd mm, r/m32: the dword into lane 0, lane 1 cleared. */
 static inline RecompMmx MMX_FROM32(uint32_t v) {
-    RecompMmx r; r.q = 0; r.ud[0] = v; return r;
+    RecompMmx r; r.q = (uint64_t)v; return r;
 }
 
 /* -- saturation helpers ---------------------------------------- */
@@ -1436,50 +1523,76 @@ static inline uint16_t recomp_sat_u16(int32_t v) {
     return (uint16_t)(v > 65535 ? 65535 : (v < 0 ? 0 : v));
 }
 
-/* -- integer arithmetic, lane-wise, wrapping -------------------- */
-#define RECOMP_MMX_BINOP(NAME, LANES, FIELD, EXPR)                      \
+/* -- integer arithmetic, lane-wise, wrapping --------------------
+ * LANE is one of the RECOMP_MMX_* accessors; EXPR reads lane i of a and b
+ * through the same accessors. */
+#define RECOMP_MMX_BINOP(NAME, LANES, LANE, EXPR)                       \
     static inline RecompMmx NAME(RecompMmx a, RecompMmx b) {            \
         RecompMmx r; int i;                                             \
-        for (i = 0; i < (LANES); i++) { (void)b; r.FIELD[i] = (EXPR); } \
+        for (i = 0; i < (LANES); i++) { (void)b; LANE(r, i) = (EXPR); } \
         return r;                                                       \
     }
 
-RECOMP_MMX_BINOP(MMX_PADDB, 8, b, (int8_t)((uint8_t)a.b[i] + (uint8_t)b.b[i]))
-RECOMP_MMX_BINOP(MMX_PADDW, 4, w, (int16_t)((uint16_t)a.w[i] + (uint16_t)b.w[i]))
-RECOMP_MMX_BINOP(MMX_PADDD, 2, d, (int32_t)((uint32_t)a.d[i] + (uint32_t)b.d[i]))
-RECOMP_MMX_BINOP(MMX_PSUBB, 8, b, (int8_t)((uint8_t)a.b[i] - (uint8_t)b.b[i]))
-RECOMP_MMX_BINOP(MMX_PSUBW, 4, w, (int16_t)((uint16_t)a.w[i] - (uint16_t)b.w[i]))
-RECOMP_MMX_BINOP(MMX_PSUBD, 2, d, (int32_t)((uint32_t)a.d[i] - (uint32_t)b.d[i]))
-RECOMP_MMX_BINOP(MMX_PADDSB, 8, b, recomp_sat_i8((int32_t)a.b[i] + b.b[i]))
-RECOMP_MMX_BINOP(MMX_PADDSW, 4, w, recomp_sat_i16((int32_t)a.w[i] + b.w[i]))
-RECOMP_MMX_BINOP(MMX_PSUBSB, 8, b, recomp_sat_i8((int32_t)a.b[i] - b.b[i]))
-RECOMP_MMX_BINOP(MMX_PSUBSW, 4, w, recomp_sat_i16((int32_t)a.w[i] - b.w[i]))
-RECOMP_MMX_BINOP(MMX_PADDUSB, 8, ub,
-                 recomp_sat_u8((int32_t)a.ub[i] + b.ub[i]))
-RECOMP_MMX_BINOP(MMX_PSUBUSB, 8, ub,
-                 recomp_sat_u8((int32_t)a.ub[i] - b.ub[i]))
-RECOMP_MMX_BINOP(MMX_PADDUSW, 4, uw,
-                 recomp_sat_u16((int32_t)a.uw[i] + b.uw[i]))
-RECOMP_MMX_BINOP(MMX_PSUBUSW, 4, uw,
-                 recomp_sat_u16((int32_t)a.uw[i] - b.uw[i]))
-RECOMP_MMX_BINOP(MMX_PMULLW, 4, w, (int16_t)((int32_t)a.w[i] * b.w[i]))
-RECOMP_MMX_BINOP(MMX_PMULHW, 4, w, (int16_t)(((int32_t)a.w[i] * b.w[i]) >> 16))
-RECOMP_MMX_BINOP(MMX_PAVGB, 8, ub, (uint8_t)(((int32_t)a.ub[i] + b.ub[i] + 1) >> 1))
-RECOMP_MMX_BINOP(MMX_PAVGW, 4, uw, (uint16_t)(((int32_t)a.uw[i] + b.uw[i] + 1) >> 1))
-RECOMP_MMX_BINOP(MMX_PMINSW, 4, w, (a.w[i] < b.w[i] ? a.w[i] : b.w[i]))
-RECOMP_MMX_BINOP(MMX_PMAXSW, 4, w, (a.w[i] > b.w[i] ? a.w[i] : b.w[i]))
-RECOMP_MMX_BINOP(MMX_PCMPEQB, 8, b, (int8_t)(a.b[i] == b.b[i] ? -1 : 0))
-RECOMP_MMX_BINOP(MMX_PCMPEQW, 4, w, (int16_t)(a.w[i] == b.w[i] ? -1 : 0))
-RECOMP_MMX_BINOP(MMX_PCMPEQD, 2, d, (int32_t)(a.d[i] == b.d[i] ? -1 : 0))
-RECOMP_MMX_BINOP(MMX_PCMPGTB, 8, b, (int8_t)(a.b[i] > b.b[i] ? -1 : 0))
-RECOMP_MMX_BINOP(MMX_PCMPGTW, 4, w, (int16_t)(a.w[i] > b.w[i] ? -1 : 0))
-RECOMP_MMX_BINOP(MMX_PCMPGTD, 2, d, (int32_t)(a.d[i] > b.d[i] ? -1 : 0))
+RECOMP_MMX_BINOP(MMX_PADDB, 8, RECOMP_MMX_B,
+                 (int8_t)((uint8_t)RECOMP_MMX_B(a, i) + (uint8_t)RECOMP_MMX_B(b, i)))
+RECOMP_MMX_BINOP(MMX_PADDW, 4, RECOMP_MMX_W,
+                 (int16_t)((uint16_t)RECOMP_MMX_W(a, i) + (uint16_t)RECOMP_MMX_W(b, i)))
+RECOMP_MMX_BINOP(MMX_PADDD, 2, RECOMP_MMX_D,
+                 (int32_t)((uint32_t)RECOMP_MMX_D(a, i) + (uint32_t)RECOMP_MMX_D(b, i)))
+RECOMP_MMX_BINOP(MMX_PSUBB, 8, RECOMP_MMX_B,
+                 (int8_t)((uint8_t)RECOMP_MMX_B(a, i) - (uint8_t)RECOMP_MMX_B(b, i)))
+RECOMP_MMX_BINOP(MMX_PSUBW, 4, RECOMP_MMX_W,
+                 (int16_t)((uint16_t)RECOMP_MMX_W(a, i) - (uint16_t)RECOMP_MMX_W(b, i)))
+RECOMP_MMX_BINOP(MMX_PSUBD, 2, RECOMP_MMX_D,
+                 (int32_t)((uint32_t)RECOMP_MMX_D(a, i) - (uint32_t)RECOMP_MMX_D(b, i)))
+RECOMP_MMX_BINOP(MMX_PADDSB, 8, RECOMP_MMX_B,
+                 recomp_sat_i8((int32_t)RECOMP_MMX_B(a, i) + RECOMP_MMX_B(b, i)))
+RECOMP_MMX_BINOP(MMX_PADDSW, 4, RECOMP_MMX_W,
+                 recomp_sat_i16((int32_t)RECOMP_MMX_W(a, i) + RECOMP_MMX_W(b, i)))
+RECOMP_MMX_BINOP(MMX_PSUBSB, 8, RECOMP_MMX_B,
+                 recomp_sat_i8((int32_t)RECOMP_MMX_B(a, i) - RECOMP_MMX_B(b, i)))
+RECOMP_MMX_BINOP(MMX_PSUBSW, 4, RECOMP_MMX_W,
+                 recomp_sat_i16((int32_t)RECOMP_MMX_W(a, i) - RECOMP_MMX_W(b, i)))
+RECOMP_MMX_BINOP(MMX_PADDUSB, 8, RECOMP_MMX_UB,
+                 recomp_sat_u8((int32_t)RECOMP_MMX_UB(a, i) + RECOMP_MMX_UB(b, i)))
+RECOMP_MMX_BINOP(MMX_PSUBUSB, 8, RECOMP_MMX_UB,
+                 recomp_sat_u8((int32_t)RECOMP_MMX_UB(a, i) - RECOMP_MMX_UB(b, i)))
+RECOMP_MMX_BINOP(MMX_PADDUSW, 4, RECOMP_MMX_UW,
+                 recomp_sat_u16((int32_t)RECOMP_MMX_UW(a, i) + RECOMP_MMX_UW(b, i)))
+RECOMP_MMX_BINOP(MMX_PSUBUSW, 4, RECOMP_MMX_UW,
+                 recomp_sat_u16((int32_t)RECOMP_MMX_UW(a, i) - RECOMP_MMX_UW(b, i)))
+RECOMP_MMX_BINOP(MMX_PMULLW, 4, RECOMP_MMX_W,
+                 (int16_t)((int32_t)RECOMP_MMX_W(a, i) * RECOMP_MMX_W(b, i)))
+RECOMP_MMX_BINOP(MMX_PMULHW, 4, RECOMP_MMX_W,
+                 (int16_t)(((int32_t)RECOMP_MMX_W(a, i) * RECOMP_MMX_W(b, i)) >> 16))
+RECOMP_MMX_BINOP(MMX_PAVGB, 8, RECOMP_MMX_UB,
+                 (uint8_t)(((int32_t)RECOMP_MMX_UB(a, i) + RECOMP_MMX_UB(b, i) + 1) >> 1))
+RECOMP_MMX_BINOP(MMX_PAVGW, 4, RECOMP_MMX_UW,
+                 (uint16_t)(((int32_t)RECOMP_MMX_UW(a, i) + RECOMP_MMX_UW(b, i) + 1) >> 1))
+RECOMP_MMX_BINOP(MMX_PMINSW, 4, RECOMP_MMX_W,
+                 (RECOMP_MMX_W(a, i) < RECOMP_MMX_W(b, i) ? RECOMP_MMX_W(a, i) : RECOMP_MMX_W(b, i)))
+RECOMP_MMX_BINOP(MMX_PMAXSW, 4, RECOMP_MMX_W,
+                 (RECOMP_MMX_W(a, i) > RECOMP_MMX_W(b, i) ? RECOMP_MMX_W(a, i) : RECOMP_MMX_W(b, i)))
+RECOMP_MMX_BINOP(MMX_PCMPEQB, 8, RECOMP_MMX_B,
+                 (int8_t)(RECOMP_MMX_B(a, i) == RECOMP_MMX_B(b, i) ? -1 : 0))
+RECOMP_MMX_BINOP(MMX_PCMPEQW, 4, RECOMP_MMX_W,
+                 (int16_t)(RECOMP_MMX_W(a, i) == RECOMP_MMX_W(b, i) ? -1 : 0))
+RECOMP_MMX_BINOP(MMX_PCMPEQD, 2, RECOMP_MMX_D,
+                 (int32_t)(RECOMP_MMX_D(a, i) == RECOMP_MMX_D(b, i) ? -1 : 0))
+RECOMP_MMX_BINOP(MMX_PCMPGTB, 8, RECOMP_MMX_B,
+                 (int8_t)(RECOMP_MMX_B(a, i) > RECOMP_MMX_B(b, i) ? -1 : 0))
+RECOMP_MMX_BINOP(MMX_PCMPGTW, 4, RECOMP_MMX_W,
+                 (int16_t)(RECOMP_MMX_W(a, i) > RECOMP_MMX_W(b, i) ? -1 : 0))
+RECOMP_MMX_BINOP(MMX_PCMPGTD, 2, RECOMP_MMX_D,
+                 (int32_t)(RECOMP_MMX_D(a, i) > RECOMP_MMX_D(b, i) ? -1 : 0))
 
 /* pmaddwd: multiply signed words, add adjacent pairs into dwords. */
 static inline RecompMmx MMX_PMADDWD(RecompMmx a, RecompMmx b) {
     RecompMmx r;
-    r.d[0] = (int32_t)a.w[0] * b.w[0] + (int32_t)a.w[1] * b.w[1];
-    r.d[1] = (int32_t)a.w[2] * b.w[2] + (int32_t)a.w[3] * b.w[3];
+    RECOMP_MMX_D(r, 0) = (int32_t)((uint32_t)((int32_t)RECOMP_MMX_W(a, 0) * RECOMP_MMX_W(b, 0))
+                       + (uint32_t)((int32_t)RECOMP_MMX_W(a, 1) * RECOMP_MMX_W(b, 1)));
+    RECOMP_MMX_D(r, 1) = (int32_t)((uint32_t)((int32_t)RECOMP_MMX_W(a, 2) * RECOMP_MMX_W(b, 2))
+                       + (uint32_t)((int32_t)RECOMP_MMX_W(a, 3) * RECOMP_MMX_W(b, 3)));
     return r;
 }
 
@@ -1495,17 +1608,17 @@ static inline RecompMmx MMX_PXOR(RecompMmx a, RecompMmx b)  { RecompMmx r; r.q =
  * register, not one lane, and it is unsigned -- a negative-looking count is a
  * huge one, which saturates the same way.
  */
-#define RECOMP_MMX_SHIFT(NAME, LANES, FIELD, WIDTH, OP)                 \
+#define RECOMP_MMX_SHIFT(NAME, LANES, LANE, WIDTH, OP)                  \
     static inline RecompMmx NAME(RecompMmx a, uint64_t cnt) {           \
         RecompMmx r; int i;                                             \
         for (i = 0; i < (LANES); i++)                                   \
-            r.FIELD[i] = (cnt >= (WIDTH)) ? 0 : (OP);                   \
+            LANE(r, i) = (cnt >= (WIDTH)) ? 0 : (OP);                   \
         return r;                                                       \
     }
-RECOMP_MMX_SHIFT(MMX_PSLLW, 4, uw, 16, (uint16_t)(a.uw[i] << cnt))
-RECOMP_MMX_SHIFT(MMX_PSRLW, 4, uw, 16, (uint16_t)(a.uw[i] >> cnt))
-RECOMP_MMX_SHIFT(MMX_PSLLD, 2, ud, 32, (uint32_t)(a.ud[i] << cnt))
-RECOMP_MMX_SHIFT(MMX_PSRLD, 2, ud, 32, (uint32_t)(a.ud[i] >> cnt))
+RECOMP_MMX_SHIFT(MMX_PSLLW, 4, RECOMP_MMX_UW, 16, (uint16_t)(RECOMP_MMX_UW(a, i) << cnt))
+RECOMP_MMX_SHIFT(MMX_PSRLW, 4, RECOMP_MMX_UW, 16, (uint16_t)(RECOMP_MMX_UW(a, i) >> cnt))
+RECOMP_MMX_SHIFT(MMX_PSLLD, 2, RECOMP_MMX_UD, 32, (uint32_t)(RECOMP_MMX_UD(a, i) << cnt))
+RECOMP_MMX_SHIFT(MMX_PSRLD, 2, RECOMP_MMX_UD, 32, (uint32_t)(RECOMP_MMX_UD(a, i) >> cnt))
 
 static inline RecompMmx MMX_PSLLQ(RecompMmx a, uint64_t cnt) {
     RecompMmx r; r.q = (cnt >= 64) ? 0 : (a.q << cnt); return r;
@@ -1515,83 +1628,102 @@ static inline RecompMmx MMX_PSRLQ(RecompMmx a, uint64_t cnt) {
 }
 static inline RecompMmx MMX_PSRAW(RecompMmx a, uint64_t cnt) {
     RecompMmx r; int i; uint64_t c = (cnt >= 16) ? 15 : cnt;
-    for (i = 0; i < 4; i++) r.w[i] = (int16_t)(a.w[i] >> c);
+    for (i = 0; i < 4; i++) RECOMP_MMX_W(r, i) = (int16_t)(RECOMP_MMX_W(a, i) >> c);
     return r;
 }
 static inline RecompMmx MMX_PSRAD(RecompMmx a, uint64_t cnt) {
     RecompMmx r; int i; uint64_t c = (cnt >= 32) ? 31 : cnt;
-    for (i = 0; i < 2; i++) r.d[i] = (int32_t)(a.d[i] >> c);
+    for (i = 0; i < 2; i++) RECOMP_MMX_D(r, i) = (int32_t)(RECOMP_MMX_D(a, i) >> c);
     return r;
 }
 
 /* -- unpack / pack ---------------------------------------------- */
 static inline RecompMmx MMX_PUNPCKLBW(RecompMmx a, RecompMmx b) {
     RecompMmx r; int i;
-    for (i = 0; i < 4; i++) { r.ub[i*2] = a.ub[i]; r.ub[i*2+1] = b.ub[i]; }
+    for (i = 0; i < 4; i++) {
+        RECOMP_MMX_UB(r, i * 2) = RECOMP_MMX_UB(a, i);
+        RECOMP_MMX_UB(r, i * 2 + 1) = RECOMP_MMX_UB(b, i);
+    }
     return r;
 }
 static inline RecompMmx MMX_PUNPCKHBW(RecompMmx a, RecompMmx b) {
     RecompMmx r; int i;
-    for (i = 0; i < 4; i++) { r.ub[i*2] = a.ub[i+4]; r.ub[i*2+1] = b.ub[i+4]; }
+    for (i = 0; i < 4; i++) {
+        RECOMP_MMX_UB(r, i * 2) = RECOMP_MMX_UB(a, i + 4);
+        RECOMP_MMX_UB(r, i * 2 + 1) = RECOMP_MMX_UB(b, i + 4);
+    }
     return r;
 }
 static inline RecompMmx MMX_PUNPCKLWD(RecompMmx a, RecompMmx b) {
     RecompMmx r; int i;
-    for (i = 0; i < 2; i++) { r.uw[i*2] = a.uw[i]; r.uw[i*2+1] = b.uw[i]; }
+    for (i = 0; i < 2; i++) {
+        RECOMP_MMX_UW(r, i * 2) = RECOMP_MMX_UW(a, i);
+        RECOMP_MMX_UW(r, i * 2 + 1) = RECOMP_MMX_UW(b, i);
+    }
     return r;
 }
 static inline RecompMmx MMX_PUNPCKHWD(RecompMmx a, RecompMmx b) {
     RecompMmx r; int i;
-    for (i = 0; i < 2; i++) { r.uw[i*2] = a.uw[i+2]; r.uw[i*2+1] = b.uw[i+2]; }
+    for (i = 0; i < 2; i++) {
+        RECOMP_MMX_UW(r, i * 2) = RECOMP_MMX_UW(a, i + 2);
+        RECOMP_MMX_UW(r, i * 2 + 1) = RECOMP_MMX_UW(b, i + 2);
+    }
     return r;
 }
 static inline RecompMmx MMX_PUNPCKLDQ(RecompMmx a, RecompMmx b) {
-    RecompMmx r; r.ud[0] = a.ud[0]; r.ud[1] = b.ud[0]; return r;
+    RecompMmx r;
+    RECOMP_MMX_UD(r, 0) = RECOMP_MMX_UD(a, 0); RECOMP_MMX_UD(r, 1) = RECOMP_MMX_UD(b, 0);
+    return r;
 }
 static inline RecompMmx MMX_PUNPCKHDQ(RecompMmx a, RecompMmx b) {
-    RecompMmx r; r.ud[0] = a.ud[1]; r.ud[1] = b.ud[1]; return r;
+    RecompMmx r;
+    RECOMP_MMX_UD(r, 0) = RECOMP_MMX_UD(a, 1); RECOMP_MMX_UD(r, 1) = RECOMP_MMX_UD(b, 1);
+    return r;
 }
 static inline RecompMmx MMX_PACKSSWB(RecompMmx a, RecompMmx b) {
     RecompMmx r; int i;
-    for (i = 0; i < 4; i++) r.b[i]     = recomp_sat_i8(a.w[i]);
-    for (i = 0; i < 4; i++) r.b[i + 4] = recomp_sat_i8(b.w[i]);
+    for (i = 0; i < 4; i++) RECOMP_MMX_B(r, i)     = recomp_sat_i8(RECOMP_MMX_W(a, i));
+    for (i = 0; i < 4; i++) RECOMP_MMX_B(r, i + 4) = recomp_sat_i8(RECOMP_MMX_W(b, i));
     return r;
 }
 static inline RecompMmx MMX_PACKUSWB(RecompMmx a, RecompMmx b) {
     RecompMmx r; int i;
-    for (i = 0; i < 4; i++) r.ub[i]     = recomp_sat_u8(a.w[i]);
-    for (i = 0; i < 4; i++) r.ub[i + 4] = recomp_sat_u8(b.w[i]);
+    for (i = 0; i < 4; i++) RECOMP_MMX_UB(r, i)     = recomp_sat_u8(RECOMP_MMX_W(a, i));
+    for (i = 0; i < 4; i++) RECOMP_MMX_UB(r, i + 4) = recomp_sat_u8(RECOMP_MMX_W(b, i));
     return r;
 }
 static inline RecompMmx MMX_PACKSSDW(RecompMmx a, RecompMmx b) {
     RecompMmx r; int i;
-    for (i = 0; i < 2; i++) r.w[i]     = recomp_sat_i16(a.d[i]);
-    for (i = 0; i < 2; i++) r.w[i + 2] = recomp_sat_i16(b.d[i]);
+    for (i = 0; i < 2; i++) RECOMP_MMX_W(r, i)     = recomp_sat_i16(RECOMP_MMX_D(a, i));
+    for (i = 0; i < 2; i++) RECOMP_MMX_W(r, i + 2) = recomp_sat_i16(RECOMP_MMX_D(b, i));
     return r;
 }
 
 /* -- word insert / extract / shuffle ----------------------------- */
 static inline RecompMmx MMX_PSHUFW(RecompMmx a, uint32_t imm) {
     RecompMmx r; int i;
-    for (i = 0; i < 4; i++) r.uw[i] = a.uw[(imm >> (i * 2)) & 3];
+    for (i = 0; i < 4; i++)
+        RECOMP_MMX_UW(r, i) = RECOMP_MMX_UW(a, (int)((imm >> (i * 2)) & 3u));
     return r;
 }
 static inline RecompMmx MMX_PINSRW(RecompMmx a, uint32_t v, uint32_t imm) {
-    RecompMmx r = a; r.uw[imm & 3] = (uint16_t)v; return r;
+    RecompMmx r = a; RECOMP_MMX_UW(r, (int)(imm & 3u)) = (uint16_t)v; return r;
 }
 static inline uint32_t MMX_PEXTRW(RecompMmx a, uint32_t imm) {
-    return (uint32_t)a.uw[imm & 3];
+    return (uint32_t)RECOMP_MMX_UW(a, (int)(imm & 3u));
 }
 static inline uint32_t MMX_PMOVMSKB(RecompMmx a) {
     uint32_t m = 0; int i;
-    for (i = 0; i < 8; i++) if (a.ub[i] & 0x80) m |= (1u << i);
+    for (i = 0; i < 8; i++) if (RECOMP_MMX_UB(a, i) & 0x80) m |= (1u << i);
     return m;
 }
 static inline RecompMmx MMX_PSADBW(RecompMmx a, RecompMmx b) {
     RecompMmx r; int i; uint32_t s = 0;
-    for (i = 0; i < 8; i++)
-        s += (uint32_t)(a.ub[i] > b.ub[i] ? a.ub[i] - b.ub[i] : b.ub[i] - a.ub[i]);
-    r.q = 0; r.uw[0] = (uint16_t)s;
+    for (i = 0; i < 8; i++) {
+        uint32_t x = RECOMP_MMX_UB(a, i), y = RECOMP_MMX_UB(b, i);
+        s += x > y ? x - y : y - x;
+    }
+    r.q = (uint64_t)(uint16_t)s;
     return r;
 }
 

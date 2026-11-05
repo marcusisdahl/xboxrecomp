@@ -3263,10 +3263,10 @@ class Lifter:
                 if dst.type == "mem":
                     return ([f"MMX_STORE({_fmt_mem(dst)}, {ops[1].reg}); /* movq */"]
                             if wide else
-                            [f"MEM32({_fmt_mem(dst)}) = {ops[1].reg}.ud[0];"
+                            [f"MEM32({_fmt_mem(dst)}) = RECOMP_MMX_UD({ops[1].reg}, 0);"
                              " /* movd */"])
                 if dst.type == "reg":
-                    return [f"{dst.reg} = {ops[1].reg}.ud[0]; /* movd */"]
+                    return [f"{dst.reg} = RECOMP_MMX_UD({ops[1].reg}, 0); /* movd */"]
             return self._unimplemented(insn, m)
 
         # movntq: a non-temporal store. The hint is irrelevant; the store is not.
@@ -3426,7 +3426,7 @@ class Lifter:
                     if _is_xmm(ops[1]):
                         src = f"{ops[1].reg}.u[0]"
                     elif _is_mmx(ops[1]):
-                        src = f"(uint32_t){ops[1].reg}"
+                        src = f"RECOMP_MMX_UD({ops[1].reg}, 0)"
                     else:
                         src = _fmt_operand_read(ops[1])
                     return [f"{ops[0].reg} = XMM_SCALAR_BITS({src});"
