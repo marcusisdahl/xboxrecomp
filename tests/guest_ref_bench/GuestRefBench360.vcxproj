@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Xbox 360 build of the guest-access micro-benchmark (guest_ref_bench.cpp).
+     msbuild GuestRefBench360.vcxproj /p:Configuration=Release '/p:Platform=Xbox 360'
+       /p:PlatformToolset=2010-01 [/p:SrcDir=...] [/p:TypesDir=...] /p:BenchOut=<dir>\
+     then XexTool -m r -r a <dir>\default.xex. The XEX writes
+     game:\guest_ref_bench.txt, echoes each line as debug output and ends with
+     "DONE". SrcDir/TypesDir select the bus sources and recomp_types.h under
+     test (defaults: this toolkit), so a before/after pair can be built;
+     /p:BenchDefines=XR_GUEST_FAST_ONE_BUS builds the one-bus variant. -->
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Release|Xbox 360">
+      <Configuration>Release</Configuration>
+      <Platform>Xbox 360</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{3C9F6A21-7B4E-4D8A-9E25-61B0C4D7A913}</ProjectGuid>
+    <RootNamespace>GuestRefBench360</RootNamespace>
+    <XboxRecompDir>$(MSBuildThisFileDirectory)..\..</XboxRecompDir>
+    <SrcDir Condition="'$(SrcDir)' == ''">$(XboxRecompDir)\src</SrcDir>
+    <TypesDir Condition="'$(TypesDir)' == ''">$(XboxRecompDir)\templates\runtime</TypesDir>
+    <BenchOut Condition="'$(BenchOut)' == ''">$(XboxRecompDir)\build\guest_ref_bench_x360\</BenchOut>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <PlatformToolset Condition="'$(PlatformToolset)' == ''">2010-01</PlatformToolset>
+    <RxdkModernXdkHeaders>true</RxdkModernXdkHeaders>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <PropertyGroup>
+    <OutDir>$(BenchOut)</OutDir>
+    <IntDir>$(BenchOut)obj\</IntDir>
+    <TargetName>default</TargetName>
+    <OutputFile>$(IntDir)GuestRefBench360.exe</OutputFile>
+    <ImageXexOutput>$(OutDir)default.xex</ImageXexOutput>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <Optimization>MaxSpeed</Optimization>
+      <FloatingPointModel>Precise</FloatingPointModel>
+      <TrackerLogDirectory>$(IntDir)</TrackerLogDirectory>
+      <PreprocessorDefinitions>NDEBUG;$(BenchDefines);%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(TypesDir);$(SrcDir);$(SrcDir)\platform;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+    <Link>
+      <OutputFile>$(OutputFile)</OutputFile>
+      <TrackerLogDirectory>$(IntDir)</TrackerLogDirectory>
+    </Link>
+    <Deploy>
+      <ExcludedFromBuild>true</ExcludedFromBuild>
+    </Deploy>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="guest_ref_bench.cpp" />
+    <ClCompile Include="$(SrcDir)\platform\recomp_guest_bus.c" />
+    <ClCompile Include="$(SrcDir)\platform\recomp_guest_atomic_win.cpp" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

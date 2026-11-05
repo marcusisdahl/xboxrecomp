@@ -16,9 +16,88 @@ static const XrGuestRegion *find_region(const XrGuestBus *bus, uint32_t address)
     return NULL;
 }
 
+/* Fast-path page table (see the header). [s_fast_lo, s_fast_hi) bounds the
+ * entries ever set since the last clear, so releasing a small test bus does
+ * not rewrite the whole table. */
+uint8_t *xr_guest_fast_page[XR_GUEST_FAST_PAGES];
+const XrGuestBus *xr_guest_fast_bus;
+static uint32_t s_fast_lo = XR_GUEST_FAST_PAGES, s_fast_hi;
+
+static void fast_clear(void)
+{
+    if (s_fast_lo < s_fast_hi)
+        memset(&xr_guest_fast_page[s_fast_lo], 0,
+               (size_t)(s_fast_hi - s_fast_lo) * sizeof(xr_guest_fast_page[0]));
+    s_fast_lo = XR_GUEST_FAST_PAGES; s_fast_hi = 0;
+    xr_guest_fast_bus = NULL;
+}
+
+#define FAST_RW (XR_GUEST_READ | XR_GUEST_WRITE)
+
+/* Host address of guest page p when one read/write RAM mapping covers all
+ * of it, else NULL. */
+static uint8_t *ram_page(const XrGuestBus *bus, uint32_t p)
+{
+    uint64_t a = (uint64_t)p << XR_GUEST_FAST_PAGE_SHIFT;
+    const XrGuestRegion *r;
+    if (p >= XR_GUEST_FAST_PAGES) return NULL;
+    r = find_region(bus, (uint32_t)a);
+    if (!r || !r->ram || (r->permissions & FAST_RW) != FAST_RW ||
+        a + XR_GUEST_FAST_PAGE_SIZE > (uint64_t)r->base + r->size) return NULL;
+    return r->ram + (a - r->base);
+}
+
+static void fast_put(uint32_t p, uint8_t *host)
+{
+    xr_guest_fast_page[p] = host;
+    if (host) {
+        if (p < s_fast_lo) s_fast_lo = p;
+        if (p + 1 > s_fast_hi) s_fast_hi = p + 1;
+    }
+}
+
+/* Page p is listed when it and page p + 1 are both RAM pages and p + 1's
+ * backing follows p's: then any access of up to a page that starts in p is
+ * plain RAM, and the inline test needs no in-page bounds check. */
+static void fast_set(const XrGuestBus *bus, uint32_t p)
+{
+    uint8_t *here = ram_page(bus, p);
+    if (here && ram_page(bus, p + 1) != here + XR_GUEST_FAST_PAGE_SIZE) here = NULL;
+    fast_put(p, here);
+}
+
+/* Update the entries a new RAM mapping can change: its own pages and the
+ * page before it. (Device windows never make a page eligible, and cannot
+ * overlap one that already is.) */
+static void fast_add(const XrGuestBus *bus, const XrGuestRegion *r)
+{
+    uint64_t end = (uint64_t)r->base + r->size;
+    uint32_t first = (uint32_t)(((uint64_t)r->base + XR_GUEST_FAST_PAGE_SIZE - 1) >> XR_GUEST_FAST_PAGE_SHIFT);
+    uint32_t last = (uint32_t)(end >> XR_GUEST_FAST_PAGE_SHIFT);   /* full pages: [first, last) */
+    uint32_t p;
+    if (!r->ram) return;
+    if (first > 0) fast_set(bus, first - 1);
+    if (first >= last) return;
+    if ((r->permissions & FAST_RW) == FAST_RW)
+        for (p = first; p + 1 < last; ++p)   /* the next page is this mapping too */
+            fast_put(p, r->ram + (((uint64_t)p << XR_GUEST_FAST_PAGE_SHIFT) - r->base));
+    fast_set(bus, last - 1);
+}
+
+void xr_guest_fast_select(const XrGuestBus *bus)
+{
+    unsigned i;
+    fast_clear();
+    xr_guest_fast_bus = bus;
+    if (bus)
+        for (i = 0; i < bus->count; ++i) fast_add(bus, &bus->regions[i]);
+}
+
 void xr_guest_bus_init(XrGuestBus *bus)
 {
-    if (bus) memset(bus, 0, sizeof(*bus));
+    if (!bus) return;
+    if (bus == xr_guest_fast_bus) fast_clear();
+    memset(bus, 0, sizeof(*bus));
 }
 
 static XrGuestStatus add_region(XrGuestBus *bus, const XrGuestRegion *region)
@@ -34,6 +113,8 @@ static XrGuestStatus add_region(XrGuestBus *bus, const XrGuestRegion *region)
     }
     if (bus->count == XR_GUEST_MAX_REGIONS) return XR_GUEST_CAPACITY;
     bus->regions[bus->count++] = *region;
+    if (region->ram && !xr_guest_fast_bus) xr_guest_fast_bus = bus;
+    if (bus == xr_guest_fast_bus) fast_add(bus, &bus->regions[bus->count - 1]);
     return XR_GUEST_OK;
 }
 
@@ -262,13 +343,20 @@ XrGuestStatus xr_guest_xbox_retail_map(XrGuestBus *bus, void *ram, size_t ram_si
     for (i = 0; i <= 28; ++i) {
         status = xr_guest_map_ram(&next, i * XR_GUEST_RETAIL_RAM, XR_GUEST_RETAIL_RAM,
             ram, XR_GUEST_READ | XR_GUEST_WRITE);
-        if (status != XR_GUEST_OK) return status;
+        if (status != XR_GUEST_OK) break;
     }
-    status = xr_guest_map_ram(&next, 0x80000000u, XR_GUEST_RETAIL_RAM, contiguous, XR_GUEST_READ | XR_GUEST_WRITE);
-    if (status != XR_GUEST_OK) return status;
-    status = xr_guest_map_ram(&next, 0xf0000000u, XR_GUEST_RETAIL_RAM, contiguous, XR_GUEST_READ | XR_GUEST_WRITE);
-    if (status != XR_GUEST_OK) return status;
+    if (status == XR_GUEST_OK)
+        status = xr_guest_map_ram(&next, 0x80000000u, XR_GUEST_RETAIL_RAM, contiguous, XR_GUEST_READ | XR_GUEST_WRITE);
+    if (status == XR_GUEST_OK)
+        status = xr_guest_map_ram(&next, 0xf0000000u, XR_GUEST_RETAIL_RAM, contiguous, XR_GUEST_READ | XR_GUEST_WRITE);
+    if (status != XR_GUEST_OK) {
+        if (xr_guest_fast_bus == &next) fast_clear();   /* bus is unchanged */
+        return status;
+    }
     *bus = next;
+    /* The table follows the bus that now holds these mappings. */
+    if (xr_guest_fast_bus == &next) xr_guest_fast_bus = bus;
+    else if (xr_guest_fast_bus == bus) xr_guest_fast_select(bus);
     return XR_GUEST_OK;
 }
 

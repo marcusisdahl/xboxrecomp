@@ -76,6 +76,36 @@ XrGuestStatus xr_guest_xbox_retail_map(XrGuestBus *, void *ram, size_t ram_size,
                                       void *contiguous, size_t contiguous_size);
 const char *xr_guest_status_name(XrGuestStatus);
 
+/* RAM fast-path page table, for inline accessors (recomp_guest_ref.h).
+ *
+ * xr_guest_fast_page[p] is the host address of guest page p (guest
+ * addresses p << 12 ...) when, on bus xr_guest_fast_bus, page p and page
+ * p + 1 each lie entirely in a RAM mapping with both read and write
+ * permission and page p + 1's backing directly follows page p's; otherwise
+ * NULL. So any access of at most XR_GUEST_FAST_PAGE_SIZE bytes that starts
+ * in a listed page is plain RAM, contiguous on the host, with no bounds
+ * check. Device windows, unmapped pages, read-only or write-only RAM, pages
+ * only partly covered by a mapping and the last page before any of those
+ * (or before a jump in the backing, as at the end of each RAM mirror) are
+ * never listed, so an accessor that finds NULL (or a different bus) takes
+ * the normal xr_guest_load/xr_guest_store path with its faults and device
+ * dispatch.
+ *
+ * The bus functions maintain the table; callers only read it. The first bus
+ * that maps RAM while no bus owns the table becomes its owner, and stays so
+ * until xr_guest_bus_init() is called on it or xr_guest_fast_select() picks
+ * another bus. xr_guest_xbox_retail_map() keeps ownership with the bus it
+ * fills. Like the region list, the table must be complete before guest
+ * threads run. */
+#define XR_GUEST_FAST_PAGE_SHIFT 12
+#define XR_GUEST_FAST_PAGE_SIZE (1u << XR_GUEST_FAST_PAGE_SHIFT)
+#define XR_GUEST_FAST_PAGES (1u << (32 - XR_GUEST_FAST_PAGE_SHIFT))
+extern uint8_t *xr_guest_fast_page[XR_GUEST_FAST_PAGES];
+extern const XrGuestBus *xr_guest_fast_bus;
+/* Make bus the table's owner and rebuild the table from its mappings
+ * (NULL: no owner, every inline access takes the normal path). */
+void xr_guest_fast_select(const XrGuestBus *bus);
+
 #ifdef __cplusplus
 }
 #endif

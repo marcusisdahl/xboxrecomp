@@ -1,7 +1,11 @@
 cmake_minimum_required(VERSION 3.20)
-project(guest_bus_checks C)
+project(guest_bus_checks C CXX)
 enable_testing()
 add_executable(guest_bus_test test_main.c bus_checks.c ../../src/platform/recomp_guest_bus.c)
 target_include_directories(guest_bus_test PRIVATE ../../src)
 set_property(TARGET guest_bus_test PROPERTY C_STANDARD 11)
 add_test(NAME guest_bus COMMAND guest_bus_test)
+# The inline RAM fast path of recomp_guest_ref.h against the bus functions.
+add_executable(guest_ref_test guest_ref_checks.cpp ../../src/platform/recomp_guest_bus.c)
+target_include_directories(guest_ref_test PRIVATE ../../src)
+add_test(NAME guest_ref COMMAND guest_ref_test)

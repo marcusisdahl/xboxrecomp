@@ -322,9 +322,18 @@ static inline double recomp_fp_round24(double x) {
 /* Values in the existing double-backed stack are all representable as normal
  * x87 extended values, including binary64 subnormals. Empty stack tags and
  * unsupported extended encodings are not represented by this stack model. */
+/* Classification by comparison, for the hot x87 helpers. MSVC's isfinite,
+ * isnan and isinf are CRT calls (_dtest in C++; _finite/_isnan on the Xbox
+ * 360 shim), which cost more than the helpers' own work; a comparison stays
+ * in the FPU (no float-to-integer register move, which stalls the 360).
+ * Like RECOMP_FCMP, these rely on IEEE comparisons (/fp:precise). */
+#define RECOMP_FP_MAX_FINITE 1.7976931348623157e308
+static inline int recomp_fp_isfinite(double x) { return fabs(x) <= RECOMP_FP_MAX_FINITE; }
+static inline int recomp_fp_isnan(double x) { return x != x; }
+static inline int recomp_fp_isinf(double x) { return fabs(x) > RECOMP_FP_MAX_FINITE && x == x; }
 static inline uint16_t recomp_fxam(double value) {
     return (uint16_t)((signbit(value) ? 0x0200u : 0u) |
-        (isnan(value) ? 0x0100u : isinf(value) ? 0x0500u :
+        (recomp_fp_isnan(value) ? 0x0100u : recomp_fp_isinf(value) ? 0x0500u :
          value == 0.0 ? 0x4000u : 0x0400u));
 }
 
@@ -363,7 +372,7 @@ static inline uint16_t recomp_fxam(double value) {
  * FPTAN push only when the hardware does. */
 #define RECOMP_X87_PI66_D 1.2874146789751208e-21 /* 0x1.8518e2da2e893p-70 */
 static inline int recomp_x87_trig_oor(double x) {
-    return isfinite(x) && fabs(x) >= 9223372036854775808.0; /* 2^63 */
+    return fabs(x) >= 9223372036854775808.0 && recomp_fp_isfinite(x); /* 2^63 */
 }
 static inline void recomp_x87_shift(double x, double *s, double *c) {
     double e = x * RECOMP_X87_PI66_D, se, v, sx = *s, cx = *c;
@@ -383,7 +392,7 @@ static inline int recomp_x87_cc_c2(uint16_t *cc, int oor) {
 static inline int recomp_x87_fsin(double *st0, uint16_t *cc) {
     double x = *st0, s, c;
     if (recomp_x87_trig_oor(x)) return recomp_x87_cc_c2(cc, 1);
-    if (!(fabs(x) > 0.78539816339744830962) || !isfinite(x)) {
+    if (!(fabs(x) > 0.78539816339744830962) || !recomp_fp_isfinite(x)) {
         *st0 = sin(x);
     } else {
         s = sin(x); c = cos(x);
@@ -395,7 +404,7 @@ static inline int recomp_x87_fsin(double *st0, uint16_t *cc) {
 static inline int recomp_x87_fcos(double *st0, uint16_t *cc) {
     double x = *st0, s, c;
     if (recomp_x87_trig_oor(x)) return recomp_x87_cc_c2(cc, 1);
-    if (!(fabs(x) > 0.78539816339744830962) || !isfinite(x)) {
+    if (!(fabs(x) > 0.78539816339744830962) || !recomp_fp_isfinite(x)) {
         *st0 = cos(x);
     } else {
         s = sin(x); c = cos(x);
@@ -409,7 +418,7 @@ static inline int recomp_x87_fsincos(double *st0, double *cos_out, uint16_t *cc)
     double x = *st0, s, c;
     if (recomp_x87_trig_oor(x)) return recomp_x87_cc_c2(cc, 1);
     s = sin(x); c = cos(x);
-    if (fabs(x) > 0.78539816339744830962 && isfinite(x))
+    if (fabs(x) > 0.78539816339744830962 && recomp_fp_isfinite(x))
         recomp_x87_shift(x, &s, &c);
     *st0 = s; *cos_out = c;
     return recomp_x87_cc_c2(cc, 0);
@@ -420,7 +429,7 @@ static inline int recomp_x87_fptan(double *st0, double *push, uint16_t *cc) {
     double x = *st0, s, c;
     if (recomp_x87_trig_oor(x)) return recomp_x87_cc_c2(cc, 1);
     *push = 1.0;
-    if (!isfinite(x)) {
+    if (!recomp_fp_isfinite(x)) {
         *st0 = *push = tan(x);
     } else if (!(fabs(x) > 0.78539816339744830962)) {
         *st0 = tan(x);
@@ -445,29 +454,41 @@ static inline int recomp_x87_fptan(double *st0, double *push, uint16_t *cc) {
  * ceil() are `fldcw RC=down/up` (via _ctrlfp) around _frnd, a bare frndint,
  * so a frndint lifted as rint() made both of them round to nearest.
  * NaN, the infinities and values already integral come back unchanged, and a
- * zero result keeps the operand's sign, as FRNDINT's does. */
+ * zero result keeps the operand's sign, as FRNDINT's does.
+ *
+ * Every FIST/FISTP runs this, so it makes no library calls: |value| >= 2^52,
+ * the infinities and NaN are integral or unordered and returned as they are;
+ * below 2^52 the int64 truncation is exact, and floor/ceil/nearest-even
+ * follow from it. Same results as floor/ceil/trunc/fmod, except that
+ * recomp_x87_round may return +0.0 where they give -0.0 (FIST cannot tell;
+ * recomp_frndint restores the sign). */
+static inline double recomp_x87_round(double value, uint16_t control) {
+    double t, lo, fraction;
+    if (!(fabs(value) < 4503599627370496.0)) return value;   /* 2^52, inf, NaN */
+    t = (double)(int64_t)value;                               /* toward zero */
+    switch ((control >> 10) & 3) {
+    case 1: return t > value ? t - 1.0 : t;                   /* down */
+    case 2: return t < value ? t + 1.0 : t;                   /* up */
+    case 3: return t;                                         /* chop */
+    default:                                                  /* nearest-even */
+        lo = t > value ? t - 1.0 : t;
+        fraction = value - lo;
+        if (fraction > 0.5 || (fraction == 0.5 && ((int64_t)lo & 1))) return lo + 1.0;
+        return lo;
+    }
+}
 static inline double recomp_frndint(double value, uint16_t control) {
-    double rounded;
-    if (!isfinite(value)) return value;
-    switch((control>>10)&3) {
-    case 1: rounded=floor(value); break;
-    case 2: rounded=ceil(value); break;
-    case 3: rounded=trunc(value); break;
-    default: {
-        double lo=floor(value), fraction=value-lo;
-        rounded=lo;
-        if(fraction>0.5 || (fraction==0.5 && fmod(lo,2.0)!=0.0)) rounded=lo+1.0;
-        break;
-    }
-    }
-    return rounded == 0.0 ? copysign(0.0, value) : rounded;
+    double rounded = recomp_x87_round(value, control);
+    if (rounded != 0.0) return rounded;
+    return value > 0.0 ? 0.0 : value < 0.0 ? copysign(0.0, -1.0) : value;
 }
 /* x87 integer stores use the guest RC bits, independently of host rounding.
  * Masked invalid conversions store the signed integer-indefinite value. */
 static inline int64_t recomp_fist(double value, uint16_t control, unsigned bits) {
-    double rounded = recomp_frndint(value, control);
-    double limit=ldexp(1.0,(int)bits-1);
-    if(!isfinite(rounded) || rounded < -limit || rounded >= limit)
+    double rounded = recomp_x87_round(value, control);
+    double limit = bits == 32 ? 2147483648.0 : bits == 16 ? 32768.0 :
+                   bits == 64 ? 9223372036854775808.0 : ldexp(1.0, (int)bits - 1);
+    if (!(rounded >= -limit && rounded < limit))               /* also NaN */
         return bits==64?INT64_MIN:-(INT64_C(1)<<(bits-1));
     return (int64_t)rounded;
 }
@@ -797,6 +818,41 @@ static inline RecompXmm XMM_SCALAR_BITS(uint32_t bits) {
  * Addresses are guest VAs, so they go through MEM32 like every other
  * access. Done lane-wise, which is also unaligned-safe for movups. */
 
+#if defined(RECOMP_EXPLICIT_GUEST_BUS)
+/* One fast-table lookup for all 16 bytes when they are plain RAM in one
+ * page (recomp_guest_ref.h), else the four MEM32 accesses out of line; the
+ * same four dword accesses either way. */
+XR_REF_NOINLINE inline RecompXmm recomp_xmm_mem_slow(uint32_t addr) {
+    RecompXmm r;
+    r.u[0] = MEM32(addr);      r.u[1] = MEM32(addr + 4);
+    r.u[2] = MEM32(addr + 8);  r.u[3] = MEM32(addr + 12);
+    return r;
+}
+XR_REF_NOINLINE inline void recomp_xmm_store_slow(uint32_t addr, RecompXmm v) {
+    MEM32(addr)      = v.u[0]; MEM32(addr + 4)  = v.u[1];
+    MEM32(addr + 8)  = v.u[2]; MEM32(addr + 12) = v.u[3];
+}
+/* XR_GUEST_REF_OUTLINE (recomp_guest_ref.h) keeps these out of line too. */
+#if defined(XR_GUEST_REF_OUTLINE)
+#define RECOMP_XMM_MEM_FN XR_REF_NOINLINE inline
+#else
+#define RECOMP_XMM_MEM_FN static inline
+#endif
+RECOMP_XMM_MEM_FN RecompXmm XMM_MEM(uint32_t addr) {
+    RecompXmm r;
+    uint8_t *p = xr_guest_fast_ptr(addr, 16);
+    if (!p) return recomp_xmm_mem_slow(addr);
+    r.u[0] = xr_guest_raw_load32(p);     r.u[1] = xr_guest_raw_load32(p + 4);
+    r.u[2] = xr_guest_raw_load32(p + 8); r.u[3] = xr_guest_raw_load32(p + 12);
+    return r;
+}
+RECOMP_XMM_MEM_FN void XMM_STORE(uint32_t addr, RecompXmm v) {
+    uint8_t *p = xr_guest_fast_ptr(addr, 16);
+    if (!p) { recomp_xmm_store_slow(addr, v); return; }
+    xr_guest_raw_store32(p, v.u[0]);     xr_guest_raw_store32(p + 4, v.u[1]);
+    xr_guest_raw_store32(p + 8, v.u[2]); xr_guest_raw_store32(p + 12, v.u[3]);
+}
+#else
 static inline RecompXmm XMM_MEM(uint32_t addr) {
     RecompXmm r;
     r.u[0] = MEM32(addr);      r.u[1] = MEM32(addr + 4);
@@ -808,6 +864,7 @@ static inline void XMM_STORE(uint32_t addr, RecompXmm v) {
     MEM32(addr)      = v.u[0]; MEM32(addr + 4)  = v.u[1];
     MEM32(addr + 8)  = v.u[2]; MEM32(addr + 12) = v.u[3];
 }
+#endif
 
 /* movlps/movhps move 8 bytes into or out of one half, leaving the
  * other half alone. */
