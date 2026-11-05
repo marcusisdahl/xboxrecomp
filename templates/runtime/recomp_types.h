@@ -774,6 +774,22 @@ typedef union RecompXmm {
 } RecompXmm;
 #endif
 
+/* Register operands of the XMM helpers: by const reference on the same
+ * builds as the movss proxy. By value, the Xbox 360 compiler copies each
+ * 16-byte union to the stack with 64-bit loads and stores and then reads
+ * the lanes back as floats or words -- a load-hit-store per lane. By
+ * reference the lanes are read where they are. Same results either way:
+ * every helper builds its result in a local before returning it, so
+ * `xmm0 = XMM_ADD(xmm0, xmm0)` still reads both operands first. */
+#ifndef RECOMP_XMM_REF_ARGS
+#define RECOMP_XMM_REF_ARGS RECOMP_XMM_SCALAR_PROXY
+#endif
+#if RECOMP_XMM_REF_ARGS
+#define RECOMP_XMM_IN const RecompXmm &
+#else
+#define RECOMP_XMM_IN RecompXmm
+#endif
+
 
 /* XMM lane invariant: f[k], u[k] and i[k] are x86 dword lane k on every host
  * (each is one whole 32-bit element, so host byte order never splits one),
@@ -884,7 +900,7 @@ RECOMP_XMM_MEM_FN RecompXmm XMM_MEM(uint32_t addr) {
     r.u[2] = xr_guest_raw_load32(p + 8); r.u[3] = xr_guest_raw_load32(p + 12);
     return r;
 }
-RECOMP_XMM_MEM_FN void XMM_STORE(uint32_t addr, RecompXmm v) {
+RECOMP_XMM_MEM_FN void XMM_STORE(uint32_t addr, RECOMP_XMM_IN v) {
     uint8_t *p = xr_guest_fast_ptr(addr, 16);
     if (!p) { recomp_xmm_store_slow(addr, v); return; }
     xr_guest_raw_store32(p, v.u[0]);     xr_guest_raw_store32(p + 4, v.u[1]);
@@ -898,7 +914,7 @@ static inline RecompXmm XMM_MEM(uint32_t addr) {
     return r;
 }
 
-static inline void XMM_STORE(uint32_t addr, RecompXmm v) {
+static inline void XMM_STORE(uint32_t addr, RECOMP_XMM_IN v) {
     MEM32(addr)      = v.u[0]; MEM32(addr + 4)  = v.u[1];
     MEM32(addr + 8)  = v.u[2]; MEM32(addr + 12) = v.u[3];
 }
@@ -917,26 +933,26 @@ static inline void recomp_xmm_load_half(RecompXmm *dst, uint32_t addr,
     dst->u[high * 2 + 1] = MEM32(addr + 4);
 }
 
-static inline void recomp_xmm_store_half(uint32_t addr, RecompXmm src,
+static inline void recomp_xmm_store_half(uint32_t addr, RECOMP_XMM_IN src,
                                          int high) {
     MEM32(addr)     = src.u[high * 2];
     MEM32(addr + 4) = src.u[high * 2 + 1];
 }
 
 /** movlhps: dst high = src low. */
-static inline RecompXmm XMM_MOVE_LOW_TO_HIGH(RecompXmm a, RecompXmm b) {
+static inline RecompXmm XMM_MOVE_LOW_TO_HIGH(RECOMP_XMM_IN a, RECOMP_XMM_IN b) {
     RecompXmm r; r.q[0] = a.q[0]; r.q[1] = b.q[0]; return r;
 }
 
 /** movhlps: dst low = src high. */
-static inline RecompXmm XMM_MOVE_HIGH_TO_LOW(RecompXmm a, RecompXmm b) {
+static inline RecompXmm XMM_MOVE_HIGH_TO_LOW(RECOMP_XMM_IN a, RECOMP_XMM_IN b) {
     RecompXmm r; r.q[0] = b.q[1]; r.q[1] = a.q[1]; return r;
 }
 
 /* -- packed arithmetic -- */
 
 #define RECOMP_XMM_LANEWISE(name, expr)                                   \
-    static inline RecompXmm name(RecompXmm a, RecompXmm b) {              \
+    static inline RecompXmm name(RECOMP_XMM_IN a, RECOMP_XMM_IN b) {      \
         RecompXmm r; int i;                                               \
         for (i = 0; i < 4; ++i) { (void)a; (void)b; r.f[i] = (expr); }    \
         return r;                                                         \
@@ -952,7 +968,7 @@ RECOMP_XMM_LANEWISE(XMM_MIN, (a.f[i] < b.f[i]) ? a.f[i] : b.f[i])
 RECOMP_XMM_LANEWISE(XMM_MAX, (a.f[i] > b.f[i]) ? a.f[i] : b.f[i])
 
 #define RECOMP_XMM_BITWISE(name, expr)                                    \
-    static inline RecompXmm name(RecompXmm a, RecompXmm b) {              \
+    static inline RecompXmm name(RECOMP_XMM_IN a, RECOMP_XMM_IN b) {      \
         RecompXmm r; int i;                                               \
         for (i = 0; i < 4; ++i) { (void)a; (void)b; r.u[i] = (expr); }    \
         return r;                                                         \
@@ -987,7 +1003,7 @@ static inline int recomp_cmp_pred(float a, float b, int p) {
     default: return !(a != a || b != b);
     }
 }
-static inline RecompXmm XMM_CMP_PRED(RecompXmm a, RecompXmm b, int p) {
+static inline RecompXmm XMM_CMP_PRED(RECOMP_XMM_IN a, RECOMP_XMM_IN b, int p) {
     RecompXmm r; int i;
     for (i = 0; i < 4; ++i)
         r.u[i] = recomp_cmp_pred(a.f[i], b.f[i], p) ? 0xFFFFFFFFu : 0u;
@@ -999,13 +1015,13 @@ RECOMP_XMM_LANEWISE(XMM_RSQRT, 1.0f / sqrtf(b.f[i]))
 RECOMP_XMM_LANEWISE(XMM_RCP,   1.0f / b.f[i])
 
 /** movmskps: the four lane sign bits, packed into the low nibble. */
-static inline uint32_t XMM_MOVEMASK(RecompXmm a) {
+static inline uint32_t XMM_MOVEMASK(RECOMP_XMM_IN a) {
     return ((a.u[0] >> 31) & 1u) | (((a.u[1] >> 31) & 1u) << 1)
          | (((a.u[2] >> 31) & 1u) << 2) | (((a.u[3] >> 31) & 1u) << 3);
 }
 
 /** shufps: lanes 0-1 selected out of `a`, lanes 2-3 out of `b`. */
-static inline RecompXmm XMM_SHUFFLE(RecompXmm a, RecompXmm b, uint32_t imm) {
+static inline RecompXmm XMM_SHUFFLE(RECOMP_XMM_IN a, RECOMP_XMM_IN b, uint32_t imm) {
     RecompXmm r;
     r.u[0] = a.u[(imm >> 0) & 3u]; r.u[1] = a.u[(imm >> 2) & 3u];
     r.u[2] = b.u[(imm >> 4) & 3u]; r.u[3] = b.u[(imm >> 6) & 3u];
@@ -1013,13 +1029,13 @@ static inline RecompXmm XMM_SHUFFLE(RecompXmm a, RecompXmm b, uint32_t imm) {
 }
 
 /** unpcklps / unpckhps: interleave the low or high halves. */
-static inline RecompXmm XMM_UNPACK_LOW(RecompXmm a, RecompXmm b) {
+static inline RecompXmm XMM_UNPACK_LOW(RECOMP_XMM_IN a, RECOMP_XMM_IN b) {
     RecompXmm r;
     r.u[0] = a.u[0]; r.u[1] = b.u[0]; r.u[2] = a.u[1]; r.u[3] = b.u[1];
     return r;
 }
 
-static inline RecompXmm XMM_UNPACK_HIGH(RecompXmm a, RecompXmm b) {
+static inline RecompXmm XMM_UNPACK_HIGH(RECOMP_XMM_IN a, RECOMP_XMM_IN b) {
     RecompXmm r;
     r.u[0] = a.u[2]; r.u[1] = b.u[2]; r.u[2] = a.u[3]; r.u[3] = b.u[3];
     return r;
