@@ -321,13 +321,18 @@ def test_defines_bracket_each_function():
 
 # 8. the lint ----------------------------------------------------------------
 
+_END = "    esp += 4; RC_SPILL(); return;"
+
+
 def _lint(*body, cached=("eax", "esp")):
-    tr.reg_cache_lint(list(body), "sub_test", set(cached))
+    # Each body ends in a return, so rule 4 (running off the end) stays out
+    # of the way of the rule a case is about; test_lint_off_end covers it.
+    tr.reg_cache_lint(list(body) + [_END], "sub_test", set(cached))
 
 
-def _raises(*body):
+def _raises(*body, cached=("eax", "esp")):
     try:
-        _lint(*body)
+        _lint(*body, cached=cached)
     except ValueError:
         return True
     return False
@@ -350,12 +355,158 @@ def test_lint():
           "    POP32(esp, eax);")
 
 
+def test_lint_output_macros_and_addresses():
+    # Header macros that write an argument, read from the headers.
+    outs = tr.rc_output_macros()
+    for name, idx in (("SET_LO8", {0}), ("SET_HI8", {0}), ("SET_LO16", {0}),
+                      ("PUSH32", {0}), ("POP32", {0, 1}),
+                      ("XMM_LOAD_LOW", {0}), ("XMM_LOAD_HIGH", {0})):
+        assert outs.get(name) == idx, (name, outs.get(name))
+    # A store through an argument, a comparison or && is not a write of it.
+    for name in ("XR_REF_ST16", "XR_REF_ST32", "RECOMP_ICALL_IS_CODE",
+                 "MEM32", "LO8"):
+        assert name not in outs, (name, outs[name])
+    x = ("xmm0", "esp")
+    assert _raises("    RC_SPILL(); XMM_LOAD_LOW(xmm0, MEM32(esp)); "
+                   "sub_00011000(); RC_FILL();", cached=x)
+    assert _raises("    RC_SPILL(); XMM_LOAD_HIGH((xmm0), 4u); "
+                   "sub_00011000(); RC_FILL();", cached=x)
+    assert _raises("    RC_SPILL(); POP32(esp, eax); "
+                   "sub_00011000(); RC_FILL();")
+    # Taking a register's address hands it to a writer.
+    assert _raises("    RC_SPILL(); recomp_xmm_load_half(&(xmm0), 0u, 0); "
+                   "sub_00011000(); RC_FILL();", cached=x)
+    assert _raises("    RC_SPILL(); recomp_xmm_load_half(&xmm0, 0u, 0); "
+                   "sub_00011000(); RC_FILL();", cached=x)
+    # Reads: binary &, &&, the register as an input argument.
+    _lint("    RC_SPILL(); RECOMP_PATCH_U32(eax & 0xFFu, esp && eax); "
+          "sub_00011000(); RC_FILL();")
+    _lint("    RC_SPILL(); PUSH32(g_esp, eax); sub_00011000(); RC_FILL();")
+    _lint("    RC_SPILL(); XMM_LOAD_LOW(g_xmm0, MEM32(esp)); "
+          "sub_00011000(); RC_FILL();", cached=x)
+
+
+def test_lint_xr_names_are_not_exempt():
+    # The bus helpers are allowed because the headers declare them, not
+    # because of their prefix: an undeclared xr_ call is a boundary.
+    assert any(n.startswith("xr_guest_") for n in tr.rc_allowed_calls())
+    assert _raises("    xr_runs_guest_code(eax);")
+    assert "recomp_guest_longjmp" in tr.RC_NORETURN_BOUNDARY
+    assert "recomp_guest_longjmp" not in tr.rc_allowed_calls()
+    assert _raises("    recomp_guest_longjmp(MEM32(esp), 0u);")
+    _lint("    RC_SPILL(); recomp_guest_longjmp(MEM32(esp), 0u);")
+
+
+def test_falls_off_end():
+    f = tr.rc_falls_off_end
+    assert f(["    SET_LO8(eax, 1);", "", "    /* int3: slide */"])
+    assert f(["loc_1: ;", "    (void)0;"])
+    assert f(["    if (eax) { RC_SPILL(); return; }"])
+    assert f(["    switch (eax) {", "    }"])
+    assert not f(["    esp += 4; RC_SPILL(); return; /* ret */", ""])
+    assert not f(["    goto loc_00010000;", "#undef fp_st1"])
+    assert not f(["loc_00010008: ; RC_SPILL(); return;"])
+    assert f([])
+
+
+def test_lint_off_end():
+    lint = tr.reg_cache_lint
+    try:
+        lint(["    SET_LO8(eax, 1);"], "sub_test", {"eax"})
+        raise AssertionError("ran off the end without a spill")
+    except ValueError as e:
+        assert "runs off the end" in str(e), e
+    lint(["    SET_LO8(eax, 1);", "    RC_SPILL(); /* control runs off */",
+          "#undef fp_st1"], "sub_test", {"eax"})
+    lint(["    goto loc_00010000;"], "sub_test", {"eax"})
+
+
+def _lift_at_0104(code, level="full"):
+    """Lift a two-byte function placed in the int3 padding at 0x104."""
+    img = bytearray(_image())
+    img[0x104:0x104 + len(code)] = code
+    db = _db()
+    va = BASE + 0x104
+    db[va] = {"start": f"0x{va:08X}", "end": va + len(code), "_addr": va,
+              "size": len(code), "name": f"sub_{va:08X}"}
+    ft = FunctionTranslator(bytes(img), db, reg_cache=level,
+                            seh_prolog=BASE + F_SEHP, seh_epilog=None)
+    return ft.translate_function(va, db[va])
+
+
+def test_runs_off_end_spills():
+    # mov al, 1 followed by int3 padding and no function after it: control
+    # runs off the C body, which must still write eax back.
+    c = _lift_at_0104(b"\xb0\x01")
+    body = c[c.index("{"):c.rindex("}")]
+    assert body.rstrip().endswith(
+        "SET_LO8(eax, 1);\n\n    RC_SPILL(); /* control runs off the end */"), c
+    assert "RC_SPILL" not in _lift_at_0104(b"\xb0\x01", "off")
+    # Functions that end in a return or a fallthrough tail call get none.
+    for o in (F_MAIN, F_FALL, F_RETN, F_SWITCH):
+        assert "control runs off the end" not in _lift(o), _lift(o)
+
+
+def test_pop_esp():
+    for level in ("off", "full"):
+        c = _lift_at_0104(b"\x5c\xc3", level)     # pop esp ; ret
+        assert "esp = MEM32(esp); /* pop esp */" in c, c
+        assert "POP32(esp, esp)" not in c, c
+
+
+def test_setjmp_longjmp_shapes():
+    for which, attr in (("setjmp", "SETJMP_FN"), ("longjmp", "LONGJMP_FN")):
+        ft, db = _ft()
+        setattr(ft.lifter, attr, BASE + F_RET8)
+        c = ft.translate_function(BASE + F_MAIN, db[BASE + F_MAIN])  # linted
+        line = next(l for l in c.splitlines() if f"/* {which} 0x" in l)
+        assert line.strip().startswith("RC_SPILL(); "), line
+        assert line.rstrip().endswith(
+            f"}} RC_FILL(); /* {which} 0x{BASE + F_RET8:08X} */"), line
+        # The guest call fallback spills again after its own push.
+        assert (f"PUSH32(esp, 0x{BASE + F_MAIN + 5:08X}u); RC_SPILL(); "
+                f"{_n(F_RET8)}();") in line, line
+        if which == "setjmp":
+            # The resume value goes to the global: the fill reloads eax.
+            assert ("if (_sjv) { ebp = g_seh_ebp; g_eax = (uint32_t)_sjv; }"
+                    in line), line
+        else:
+            assert ("if (!recomp_guest_longjmp(MEM32(esp), MEM32(esp + 4)))"
+                    in line), line
+        ft, db = _ft("off")
+        setattr(ft.lifter, attr, BASE + F_RET8)
+        c = ft.translate_function(BASE + F_MAIN, db[BASE + F_MAIN])
+        assert "RC_" not in c, c
+
+
+def test_header_guest_code_macros_are_boundaries():
+    # A header macro that runs guest code (through a looked-up function
+    # pointer or a boundary) is itself a boundary, or spills and fills
+    # around it. Anything else the headers name, the lint lets through.
+    hdr = open(os.path.join(ROOT, "templates", "runtime", "recomp_types.h"),
+               encoding="utf-8").read()
+    hdr = re.sub(r"/\*.*?\*/", " ", hdr, flags=re.S)
+    hdr = re.sub(r"\\\r?\n", " ", hdr)
+    runs = {}
+    for m in re.finditer(r"^[ \t]*#[ \t]*define[ \t]+(\w+)\(([^)]*)\)(.*)$",
+                         hdr, re.M):
+        body = m.group(3)
+        calls = set(re.findall(r"\b(\w+)\s*\(", body))
+        if (calls & tr.RC_BOUNDARY or re.search(r"\b_fn\s*\(\s*\)", body)
+                or "recomp_lookup" in body):
+            runs.setdefault(m.group(1), []).append(body)
+    assert set(runs) - tr.RC_BOUNDARY == {"RECOMP_SPIN_WAIT"}, sorted(runs)
+    assert any("RC_SPILL(); xbox_SpinWait(va); RC_FILL();" in b
+               for b in runs["RECOMP_SPIN_WAIT"]), runs["RECOMP_SPIN_WAIT"]
+
+
 # 9. header names the lint relies on ---------------------------------------
 
 def test_boundary_names_exist():
     hdr = open(os.path.join(ROOT, "templates", "runtime", "recomp_types.h"),
                encoding="utf-8").read()
-    for name in sorted(tr.RC_BOUNDARY | tr.RC_READ_ONLY_BOUNDARY):
+    for name in sorted(tr.RC_BOUNDARY | tr.RC_READ_ONLY_BOUNDARY
+                       | tr.RC_NORETURN_BOUNDARY):
         if name == "setjmp":
             assert "#include <setjmp.h>" in hdr
             continue

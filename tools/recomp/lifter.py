@@ -2073,11 +2073,14 @@ class Lifter:
             # the function is erased before a return-time trace can see it --
             # yet the pops run *before* that restore, so drift is exactly what
             # breaks them. This is the only point the drift is observable.
+            # pop esp loads esp from the stack; the increment is overwritten
+            # (POP32(esp, esp) would add 4 to the loaded value).
+            pop = ("esp = MEM32(esp); /* pop esp */" if r == "esp"
+                   else f"POP32(esp, {r});")
             if self.trace_exit_name:
                 return [f'{self._rcs()}RECOMP_TRACE_ESP('
-                        f'"{self.trace_exit_name}", "pop {r}");',
-                        f"POP32(esp, {r});"]
-            return [f"POP32(esp, {r});"]
+                        f'"{self.trace_exit_name}", "pop {r}");', pop]
+            return [pop]
         else:
             return [f"{{ uint32_t _tmp; POP32(esp, _tmp); {_fmt_operand_write(ops[0], '_tmp')} }}"]
 

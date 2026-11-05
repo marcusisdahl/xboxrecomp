@@ -331,7 +331,16 @@ RC_BOUNDARY = frozenset({
 })
 RC_READ_ONLY_BOUNDARY = frozenset({
     "RECOMP_TRACE_ENTER", "RECOMP_TRACE_EXIT", "RECOMP_TRACE_ESP",
-    "setjmp", "recomp_guest_longjmp",
+    "setjmp",
+})
+# Boundaries that write the register globals and do not come back when they
+# do: recomp_guest_longjmp sets g_esp/g_ebx/g_esi/g_edi and then jumps
+# natively to the setjmp site, whose own fill reloads them. When it does
+# return (no native buffer) it has written nothing. The lint treats these
+# like the read-only ones (spill before, no fill needed); they are kept apart
+# so the list says what they are.
+RC_NORETURN_BOUNDARY = frozenset({
+    "recomp_guest_longjmp",
 })
 # Helpers that take registers by value or never look at them, beyond what
 # the runtime headers declare (those are read from the headers themselves).
@@ -348,6 +357,11 @@ RC_EXTRA_ALLOWED = frozenset({
     "fp_push", "fp_pop", "fp_top", "fp_st", "fp_st1",
 })
 _RC_ALLOWED_CACHE = []
+_RC_HEADERS = (("templates", "runtime", "recomp_types.h"),
+               ("src", "platform", "recomp_guest_ref.h"),
+               ("src", "platform", "recomp_guest_bus.h"),
+               ("src", "platform", "recomp_guest_atomic_win.h"),
+               ("src", "platform", "recomp_c99_x360.h"))
 
 
 def _rc_strip(line):
@@ -371,11 +385,7 @@ def rc_allowed_calls():
         return _RC_ALLOWED_CACHE[0]
     root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
     names = set(RC_EXTRA_ALLOWED)
-    for rel in (("templates", "runtime", "recomp_types.h"),
-                ("src", "platform", "recomp_guest_ref.h"),
-                ("src", "platform", "recomp_guest_bus.h"),
-                ("src", "platform", "recomp_guest_atomic_win.h"),
-                ("src", "platform", "recomp_c99_x360.h")):
+    for rel in _RC_HEADERS:
         path = os.path.join(root, *rel)
         try:
             with open(path, encoding="utf-8") as f:
@@ -387,9 +397,83 @@ def rc_allowed_calls():
         # MMX_PCMPGTD are defined through generator macros that take the
         # name as an argument.
         names.update(re.findall(r"\b([A-Za-z_]\w*)", text))
-    names -= RC_BOUNDARY | RC_READ_ONLY_BOUNDARY
+    names -= RC_BOUNDARY | RC_READ_ONLY_BOUNDARY | RC_NORETURN_BOUNDARY
     _RC_ALLOWED_CACHE.append(frozenset(names))
     return _RC_ALLOWED_CACHE[0]
+
+
+def _rc_header_texts():
+    """The runtime headers the lint reads, as text (missing ones skipped)."""
+    root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
+    for rel in _RC_HEADERS:
+        path = os.path.join(root, *rel)
+        try:
+            with open(path, encoding="utf-8") as f:
+                yield f.read()
+        except OSError:
+            continue
+
+
+_RC_OUTPUT_CACHE = []
+
+
+def rc_output_macros():
+    """{macro: argument indices} for the header macros that write an argument.
+
+    A macro writes argument p when its body assigns to it ((p) = .., p += ..),
+    increments it, or takes its address (&(p), as XMM_LOAD_LOW does to hand
+    the register to an inline helper). Read from the headers, so a new macro
+    of that kind is seen by the lint without a list to keep in step."""
+    if _RC_OUTPUT_CACHE:
+        return _RC_OUTPUT_CACHE[0]
+    out = {}
+    for text in _rc_header_texts():
+        text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)
+        text = re.sub(r"\\\r?\n", " ", text)
+        for m in re.finditer(r"^[ \t]*#[ \t]*define[ \t]+(\w+)\(([^)]*)\)(.*)$",
+                             text, re.M):
+            name, body = m.group(1), m.group(3)
+            if name.startswith("RC_"):
+                continue      # the cache's own spill/fill/declare macros
+            for i, p in enumerate(x.strip() for x in m.group(2).split(",")):
+                if not re.match(r"^\w+$", p):
+                    continue
+                pe = re.escape(p)
+                pats = (
+                    # (p) = and p op= ; not *(T *)(p) = .. or *p = ..,
+                    # which store through p, nor s.p = ..
+                    r"(?:^|[^\w\s)\].>*])\s*\(\s*\b%s\b\s*\)\s*"
+                    r"(?:<<|>>|[-+*/%%&|^])?=(?!=)" % pe,
+                    r"(?:^|[^\w\s)\].>*])\s*\b%s\b\s*"
+                    r"(?:<<|>>|[-+*/%%&|^])?=(?!=)" % pe,
+                    r"(?<!&)&(?!&)\s*\(?\s*\b%s\b" % pe,
+                    r"(?:\+\+|--)\s*\(?\s*\b%s\b" % pe,
+                    r"\b%s\b\s*\)?\s*(?:\+\+|--)" % pe,
+                )
+                if any(re.search(q, body) for q in pats):
+                    out.setdefault(name, set()).add(i)
+    _RC_OUTPUT_CACHE.append({k: frozenset(v) for k, v in out.items()})
+    return _RC_OUTPUT_CACHE[0]
+
+
+def _rc_split_args(code, i):
+    """The top-level arguments of the call whose '(' is at code[i]."""
+    args, depth, cur = [], 0, []
+    for c in code[i + 1:]:
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            if depth == 0:
+                args.append("".join(cur))
+                return args
+            depth -= 1
+        elif c == "," and depth == 0:
+            args.append("".join(cur))
+            cur = []
+            continue
+        cur.append(c)
+    args.append("".join(cur))
+    return args
 
 
 def rc_used_registers(lines):
@@ -420,7 +504,12 @@ def _rc_close_paren(code, i):
 
 
 def _rc_writes(segment, regs):
-    """True if a code segment may write one of `regs`."""
+    """True if a code segment may write one of `regs`.
+
+    Plain assignments and increments, a header macro that writes one of its
+    arguments (rc_output_macros: SET_LO8, PUSH32, POP32, XMM_LOAD_LOW, ...)
+    given a register there, and a register whose address is taken (&xmm0):
+    whatever receives the address may write through it."""
     if not regs:
         return False
     alt = "|".join(sorted(regs, key=len, reverse=True))
@@ -429,12 +518,49 @@ def _rc_writes(segment, regs):
         r"(?:<<|>>|[-+*/%%&|^])?=(?!=)" % alt,
         r"(?:\+\+|--)\s*\b(?:%s)\b" % alt,
         r"\b(?:%s)\b\s*(?:\+\+|--)" % alt,
-        r"\b(?:SET_LO8|SET_HI8|SET_LO16|PUSH32|POP32)\s*\(\s*(?:%s)\b" % alt,
-        r"\bPOP32\s*\(\s*\w+\s*,\s*(?:%s)\b" % alt,
         r"\bRECOMP_MMX_\w+\s*\(\s*(?:%s)\b[^;]*?\)\s*"
         r"(?:<<|>>|[-+*/%%&|^])?=(?!=)" % alt,
     )
-    return any(re.search(p, segment) for p in pats)
+    if any(re.search(p, segment) for p in pats):
+        return True
+    reg_only = re.compile(r"^[\s(]*(?:%s)[\s)]*$" % alt)
+    outputs = rc_output_macros()
+    for m in re.finditer(r"\b([A-Za-z_]\w*)\s*\(", segment):
+        idx = outputs.get(m.group(1))
+        if not idx:
+            continue
+        args = _rc_split_args(segment, m.end() - 1)
+        if any(i < len(args) and reg_only.match(args[i]) for i in idx):
+            return True
+    # Unary &: the previous non-blank character is not an operand's end.
+    for m in re.finditer(r"(?<!&)&(?!&)\s*\(*\s*\b(?:%s)\b" % alt, segment):
+        before = segment[:m.start()].rstrip()
+        if not before or before[-1] not in "_)]" and not before[-1].isalnum():
+            return True
+    return False
+
+
+def rc_falls_off_end(body):
+    """True if control can run past the last statement of a function body.
+
+    body: the lines between the braces. The last statement ends control when
+    it is a top-level `return;` or `goto`; anything else (a lifted
+    instruction of data decoded as code, an int3 slide, a label) runs off
+    the closing brace, which returns from the C function."""
+    for raw in reversed(body):
+        s = raw.strip()
+        if not s or s.startswith("#"):
+            continue
+        code = _rc_strip(raw).strip()
+        if not code:
+            continue          # a comment line
+        if code.count("{") != code.count("}") or re.match(
+                r"^(?:if|else|for|while|do|switch|case|default)\b", code):
+            return True
+        code = re.sub(r"^(?:loc_\w+\s*:\s*;?\s*)+", "", code)
+        return not (re.search(r"(?:^|[;}]\s*)return\s*;$", code)
+                    or re.match(r"^goto\s+loc_\w+\s*;$", code))
+    return True
 
 
 def reg_cache_lint(lines, name, cached):
@@ -449,8 +575,18 @@ def reg_cache_lint(lines, name, cached):
        before the end of the line.
     3. Every `return;` has an RC_SPILL() earlier on its line with no write
        of a cached register in between.
-    Anything called that is not on the allow-list counts as a boundary.
+    4. A body whose control can run off the closing brace (rc_falls_off_end)
+       ends in a bare `RC_SPILL();`: that is a return too.
+    Anything called that is not on the allow-list counts as a boundary,
+    xr_* included: the bus helpers the headers declare are on the list.
     """
+    if rc_falls_off_end(lines):
+        last = next((_rc_strip(l).strip() for l in reversed(lines)
+                     if l.strip() and not l.strip().startswith("#")
+                     and _rc_strip(l).strip()), "")
+        if last != "RC_SPILL();":
+            raise ValueError(f"--reg-cache lint: {name}: control runs off the "
+                             f"end without RC_SPILL(): {last}")
     allowed = rc_allowed_calls()
     cached = set(cached)
     reg_re = (re.compile(r"\b(?:%s)\b" % "|".join(sorted(cached)))
@@ -471,10 +607,9 @@ def reg_cache_lint(lines, name, cached):
                 events.append((m.start(), "spill", m.end()))
             elif ident == "RC_FILL":
                 events.append((m.start(), "fill", m.end()))
-            elif ident in RC_READ_ONLY_BOUNDARY:
+            elif ident in RC_READ_ONLY_BOUNDARY | RC_NORETURN_BOUNDARY:
                 events.append((m.start(), "ro", _rc_close_paren(code, m.end() - 1)))
-            elif ident in RC_BOUNDARY or (
-                    ident not in allowed and not ident.startswith("xr_")):
+            elif ident in RC_BOUNDARY or ident not in allowed:
                 events.append((m.start(), "call:" + ident,
                                _rc_close_paren(code, m.end() - 1)))
         for m in re.finditer(r"\breturn\s*;", code):
@@ -2777,6 +2912,15 @@ class FunctionTranslator:
             break
         if _last_label_idx is not None and not _has_stmt_after:
             lines.insert(_last_label_idx + 1, "    (void)0;")
+
+        # After the label fix, so a trailing label keeps its (void)0.
+        # --reg-cache: a body that can run off its closing brace returns
+        # there, so it writes the locals back first like every `return;`.
+        # Data decoded as code and int3 slides end this way; without the
+        # spill their pushes would never reach g_esp.
+        if rc_on and "{" in lines and rc_falls_off_end(
+                lines[lines.index("{") + 1:]):
+            lines.append("    RC_SPILL(); /* control runs off the end */")
 
         # Undefine FPU macros
         if has_fpu:

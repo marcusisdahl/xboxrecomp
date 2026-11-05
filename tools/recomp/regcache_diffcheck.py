@@ -28,6 +28,8 @@ _DROP_LINE = re.compile(
     r"|#define RC_SPILL\(\) .*|#define RC_FILL\(\) .*"
     r"|#undef RC_SPILL|#undef RC_FILL"
     r"|\s*(?:RC_DECL_(?:GPR|MMX|XMM)\(\w+\)\s*)+)$")
+# The spill a body that runs off its closing brace gets (rc_falls_off_end).
+_OFF_END = re.compile(r"^\s*RC_SPILL\(\); /\* control runs off the end \*/$")
 _REG = r"(?:eax|ecx|edx|ebx|esp|esi|edi|mm[0-7]|xmm[0-7])"
 _PUSH = re.compile(r'^#pragma push_macro\("(%s)"\)$' % _REG)
 _POP = re.compile(r'^#pragma pop_macro\("(%s)"\)$' % _REG)
@@ -57,6 +59,10 @@ def normalise(text):
                 stats["cached"] += 1
                 stats["regs"] += len(regs)
         if _DROP_LINE.match(line):
+            i += 1
+            continue
+        if _OFF_END.match(line):
+            stats["spills"] += 1
             i += 1
             continue
         pm = _PUSH.match(line)
