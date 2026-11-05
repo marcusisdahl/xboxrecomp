@@ -15,6 +15,7 @@ import bisect
 import json
 import glob
 import os
+import re
 import struct
 import sys
 
@@ -162,7 +163,7 @@ def write_if_changed(path, text):
     return True
 
 
-def _fixup_icall_esp_save(lines):
+def _fixup_icall_esp_save(lines, reg_cache=False):
     """
     Post-process generated C lines to insert _icall_esp save points.
 
@@ -189,6 +190,9 @@ def _fixup_icall_esp_save(lines):
     Where that is still ambiguous, stopping early is the safer error: it
     under-rewinds, which surfaces as the detectable "epilogue never ran" leak,
     rather than as a caller silently carrying a wrong register.
+
+    reg_cache: the function caches its registers (--reg-cache), so the save
+    reads the local esp; g_esp is only current at a spill.
     """
     import re
     saves = tuple(
@@ -259,7 +263,8 @@ def _fixup_icall_esp_save(lines):
         if i in insert_before:
             # Determine indentation from the current line
             indent = line[:len(line) - len(line.lstrip())]
-            result.append(f"{indent}{{ uint32_t _icall_esp = g_esp;")
+            src = "esp" if reg_cache else "g_esp"
+            result.append(f"{indent}{{ uint32_t _icall_esp = {src};")
         result.append(line)
         if 'RECOMP_ICALL_SAFE(' in line or 'RECOMP_ICALL_SAFE_AT(' in line:
             indent = line[:len(line) - len(line.lstrip())]
@@ -288,6 +293,275 @@ FP_STACK_UNDEFS = [
     "    #undef fp_st",
     "    #undef fp_st1",
 ]
+
+
+# ── Register caching (--reg-cache) ─────────────────────────────────────────
+#
+# Each generated function keeps the guest registers it uses in C locals
+# (recomp_types.h maps eax -> rc_eax when the chunk defines RECOMP_REG_CACHE).
+# The lifter emits RC_SPILL()/RC_FILL() at every boundary; here each function
+# gets its RC_DECL_* line and its own RC_SPILL/RC_FILL definitions, listing
+# exactly the registers it names, and is then linted so that a boundary the
+# lifter forgot to spill around fails generation instead of becoming a silent
+# stale-register bug.
+
+REG_CACHE_LEVELS = ("off", "gpr", "full")
+RC_GPRS = ("eax", "ecx", "edx", "ebx", "esp", "esi", "edi")
+RC_MMX = tuple(f"mm{i}" for i in range(8))
+RC_XMM = tuple(f"xmm{i}" for i in range(8))
+RC_ALL = RC_GPRS + RC_MMX + RC_XMM
+_RC_REG_RE = re.compile(r"\b(eax|ecx|edx|ebx|esp|esi|edi|mm[0-7]|xmm[0-7])\b")
+
+# Lines that switch a chunk to the register-cache names. Before the include,
+# because recomp_types.h is include-guarded; the guard after it refuses an
+# older header that would silently map the names to the globals.
+REG_CACHE_PROLOGUE = ["#define RECOMP_REG_CACHE 1"]
+REG_CACHE_GUARD = [
+    "#ifndef RECOMP_REG_CACHE_SUPPORTED",
+    "#error recomp_types.h predates --reg-cache; regenerate it with this lifter",
+    "#endif",
+]
+
+# Boundaries: anything that may read or write the register globals. A
+# "read-only" boundary needs the globals current before it but changes
+# nothing a later statement of this function reads back, so it needs no fill.
+RC_BOUNDARY = frozenset({
+    "RECOMP_ABI_CALL", "RECOMP_ICALL", "RECOMP_ICALL_SAFE",
+    "RECOMP_ICALL_SAFE_AT", "RECOMP_ITAIL", "xbox_SpinWait",
+})
+RC_READ_ONLY_BOUNDARY = frozenset({
+    "RECOMP_TRACE_ENTER", "RECOMP_TRACE_EXIT", "RECOMP_TRACE_ESP",
+    "setjmp", "recomp_guest_longjmp",
+})
+# Helpers that take registers by value or never look at them, beyond what
+# the runtime headers declare (those are read from the headers themselves).
+RC_EXTRA_ALLOWED = frozenset({
+    "if", "while", "for", "switch", "sizeof", "return", "do", "defined",
+    "fabs", "fabsf", "sqrt", "sqrtf", "sin", "cos", "tan", "atan", "atan2",
+    "log", "log2", "log10", "exp", "exp2", "ldexp", "frexp", "pow", "floor",
+    "ceil", "fmod", "modf", "round", "trunc", "lrint", "rint",
+    "xbox_MmioLoad", "xbox_MmioStore", "MMIO_RD8", "MMIO_RD16", "MMIO_RD32",
+    "MMIO_WR8", "MMIO_WR16", "MMIO_WR32", "xbox_PortIn", "xbox_PortOut",
+    "xbox_Cpuid", "xbox_ReadTimeStampCounter", "recomp_debug_service",
+    "RECOMP_PATCH_U32", "RECOMP_UNIMPL", "recomp_unimpl",
+    "RC_SPILL", "RC_FILL",
+    "fp_push", "fp_pop", "fp_top", "fp_st", "fp_st1",
+})
+_RC_ALLOWED_CACHE = []
+
+
+def _rc_strip(line):
+    """A line with comments and string literals blanked (same length)."""
+    line = re.sub(r"/\*.*?\*/", lambda m: " " * len(m.group(0)), line)
+    line = re.sub(r'"(?:\\.|[^"\\])*"', lambda m: '"' + " " * (len(m.group(0)) - 2) + '"', line)
+    i = line.find("//")
+    if i >= 0:
+        line = line[:i]
+    j = line.find("/*")       # a comment that runs past the end of the line
+    if j >= 0:
+        line = line[:j]
+    return line
+
+
+def rc_allowed_calls():
+    """Every identifier the runtime headers name (macros, functions, and the
+    helpers that generator macros define), minus the boundaries, plus
+    RC_EXTRA_ALLOWED. Generated function names never appear there."""
+    if _RC_ALLOWED_CACHE:
+        return _RC_ALLOWED_CACHE[0]
+    root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
+    names = set(RC_EXTRA_ALLOWED)
+    for rel in (("templates", "runtime", "recomp_types.h"),
+                ("src", "platform", "recomp_guest_ref.h"),
+                ("src", "platform", "recomp_guest_bus.h"),
+                ("src", "platform", "recomp_guest_atomic_win.h"),
+                ("src", "platform", "recomp_c99_x360.h")):
+        path = os.path.join(root, *rel)
+        try:
+            with open(path, encoding="utf-8") as f:
+                text = f.read()
+        except OSError:
+            continue
+        text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)
+        # Every identifier, not only those followed by '(': helpers such as
+        # MMX_PCMPGTD are defined through generator macros that take the
+        # name as an argument.
+        names.update(re.findall(r"\b([A-Za-z_]\w*)", text))
+    names -= RC_BOUNDARY | RC_READ_ONLY_BOUNDARY
+    _RC_ALLOWED_CACHE.append(frozenset(names))
+    return _RC_ALLOWED_CACHE[0]
+
+
+def rc_used_registers(lines):
+    """Register names a function body names, outside comments and strings."""
+    used = set()
+    pp = False
+    for line in lines:
+        s = line.strip()
+        if pp or s.startswith("#"):
+            pp = s.endswith("\\")
+            continue
+        used.update(_RC_REG_RE.findall(_rc_strip(line)))
+    return used
+
+
+def _rc_close_paren(code, i):
+    """Index just past the parenthesis that closes the one at code[i]."""
+    depth = 0
+    for k in range(i, len(code)):
+        c = code[k]
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return k + 1
+    return len(code)
+
+
+def _rc_writes(segment, regs):
+    """True if a code segment may write one of `regs`."""
+    if not regs:
+        return False
+    alt = "|".join(sorted(regs, key=len, reverse=True))
+    pats = (
+        r"\b(?:%s)\b(?:\s*(?:\.\s*\w+|\[[^\]]*\]))*\s*"
+        r"(?:<<|>>|[-+*/%%&|^])?=(?!=)" % alt,
+        r"(?:\+\+|--)\s*\b(?:%s)\b" % alt,
+        r"\b(?:%s)\b\s*(?:\+\+|--)" % alt,
+        r"\b(?:SET_LO8|SET_HI8|SET_LO16|PUSH32|POP32)\s*\(\s*(?:%s)\b" % alt,
+        r"\bPOP32\s*\(\s*\w+\s*,\s*(?:%s)\b" % alt,
+        r"\bRECOMP_MMX_\w+\s*\(\s*(?:%s)\b[^;]*?\)\s*"
+        r"(?:<<|>>|[-+*/%%&|^])?=(?!=)" % alt,
+    )
+    return any(re.search(p, segment) for p in pats)
+
+
+def reg_cache_lint(lines, name, cached):
+    """Check one cached function body; raise ValueError on a violation.
+
+    lines: the body lines after the RC_DECL line. cached: the set C.
+
+    1. Every boundary has an RC_SPILL() earlier on its line with no write of
+       a cached register in between.
+    2. After a boundary that may change registers, nothing names a cached
+       register before an RC_FILL() or a `return;`, and one of the two comes
+       before the end of the line.
+    3. Every `return;` has an RC_SPILL() earlier on its line with no write
+       of a cached register in between.
+    Anything called that is not on the allow-list counts as a boundary.
+    """
+    allowed = rc_allowed_calls()
+    cached = set(cached)
+    reg_re = (re.compile(r"\b(?:%s)\b" % "|".join(sorted(cached)))
+              if cached else None)
+    pp = False
+    for n, raw in enumerate(lines):
+        s = raw.strip()
+        if pp or s.startswith("#"):
+            pp = s.endswith("\\")
+            continue
+        if "(" not in raw and "return" not in raw:
+            continue
+        code = _rc_strip(raw)
+        events = []   # (pos, kind, end)
+        for m in re.finditer(r"\b([A-Za-z_]\w*)\s*\(", code):
+            ident = m.group(1)
+            if ident == "RC_SPILL":
+                events.append((m.start(), "spill", m.end()))
+            elif ident == "RC_FILL":
+                events.append((m.start(), "fill", m.end()))
+            elif ident in RC_READ_ONLY_BOUNDARY:
+                events.append((m.start(), "ro", _rc_close_paren(code, m.end() - 1)))
+            elif ident in RC_BOUNDARY or (
+                    ident not in allowed and not ident.startswith("xr_")):
+                events.append((m.start(), "call:" + ident,
+                               _rc_close_paren(code, m.end() - 1)))
+        for m in re.finditer(r"\breturn\s*;", code):
+            events.append((m.start(), "ret", m.end()))
+        if not any(k not in ("spill", "fill") for _, k, _ in events):
+            continue
+        events.sort()
+
+        def fail(why):
+            raise ValueError(f"--reg-cache lint: {name}: {why}: {raw.strip()}")
+
+        last_spill = None
+        for idx, (pos, kind, end) in enumerate(events):
+            if kind == "spill":
+                last_spill = end
+                continue
+            if kind == "fill":
+                continue
+            # rules 1 and 3
+            if last_spill is None or last_spill > pos:
+                fail(f"{kind} without an earlier RC_SPILL()")
+            if _rc_writes(code[last_spill:pos], cached):
+                fail(f"register written between RC_SPILL() and {kind}")
+            if kind in ("ro", "ret"):
+                continue
+            # rule 2
+            close = None
+            for pos2, kind2, _ in events[idx + 1:]:
+                if pos2 < end:
+                    continue      # inside this call's own arguments
+                if kind2 in ("fill", "ret"):
+                    close = pos2
+                    break
+            if close is None:
+                fail(f"{kind} not followed by RC_FILL() or return")
+            if reg_re is not None and reg_re.search(code[end:close]):
+                fail(f"register read after {kind} before RC_FILL()")
+
+
+def reg_cache_wrap(lines, name, level, cached_on):
+    """Give one translated function its register cache.
+
+    lines: the whole function as emitted (comment, signature, braces).
+    level: "gpr" or "full". cached_on: False for an excluded function, which
+    keeps the global names (push_macro) and gets empty RC_SPILL/RC_FILL so a
+    RECOMP_SPIN_WAIT inside it still compiles.
+    Returns (lines, cached_set).
+    """
+    try:
+        open_idx = lines.index("{")
+    except ValueError:
+        return lines, set()
+    close_idx = max(i for i, l in enumerate(lines) if l == "}")
+    body = lines[open_idx + 1:close_idx]
+    used = rc_used_registers(body)
+    allowed = set(RC_GPRS) | (set(RC_MMX) | set(RC_XMM)
+                              if level == "full" else set())
+    cached = [r for r in RC_ALL if r in used and r in allowed] if cached_on else []
+    uncached = [r for r in RC_ALL if r in used and r not in cached]
+
+    def kind(r):
+        return "GPR" if r in RC_GPRS else "MMX" if r in RC_MMX else "XMM"
+
+    out_body = list(body)
+    if cached:
+        decl = "    " + " ".join(f"RC_DECL_{kind(r)}({r})" for r in cached)
+        at = 0
+        # The entry trace stays first: the globals are current at entry.
+        while at < len(out_body) and "RECOMP_TRACE_ENTER(" in out_body[at]:
+            at += 1
+        out_body.insert(at, decl)
+        reg_cache_lint(out_body[at + 1:], name, cached)
+    spill = " ".join(f"RC_S({r})" for r in cached)
+    fill = " ".join(f"RC_L({r})" for r in cached)
+    pre = [f"#define RC_SPILL() do {{ {spill} }} while (0)" if spill
+           else "#define RC_SPILL() do { } while (0)",
+           f"#define RC_FILL() do {{ {fill} }} while (0)" if fill
+           else "#define RC_FILL() do { } while (0)"]
+    post = ["#undef RC_SPILL", "#undef RC_FILL"]
+    for r in uncached:
+        pre += [f'#pragma push_macro("{r}")', f"#undef {r}",
+                f"#define {r} g_{r}"]
+        post.append(f'#pragma pop_macro("{r}")')
+    # Keep the function's trailing blank line after the #undefs.
+    tail = lines[close_idx + 1:]
+    return (pre + lines[:open_idx + 1] + out_body + ["}"] + post + tail,
+            set(cached))
 
 
 
@@ -405,9 +679,12 @@ class FunctionTranslator:
                  abi_db=None, seh_prolog=None, seh_epilog=None,
                  setjmp_fn=None, longjmp_fn=None,
                  trace_functions=None, force_returns=None, icall_sites=None,
-                 explicit_guest_bus=False):
+                 explicit_guest_bus=False, reg_cache="off",
+                 reg_cache_exclude=None):
         """
         xbe_data: bytes - raw XBE file contents
+        reg_cache: "off", "gpr" or "full" (--reg-cache; True means full)
+        reg_cache_exclude: function starts emitted uncached
         icall_sites: dict - call-site VA -> [target VAs] a recorded run saw
                      that site reach (tools.recomp.icall_feedback merge)
         func_db: dict - addr → function info from functions.json
@@ -429,7 +706,16 @@ class FunctionTranslator:
                              xbe_data=xbe_data, seh_prolog=seh_prolog,
                              setjmp_fn=setjmp_fn, longjmp_fn=longjmp_fn,
                              seh_epilog=seh_epilog,
-                             explicit_guest_bus=explicit_guest_bus)
+                             explicit_guest_bus=explicit_guest_bus,
+                             reg_cache=reg_cache)
+        self.reg_cache = self.lifter.reg_cache
+        if self.reg_cache not in REG_CACHE_LEVELS:
+            raise ValueError(f"reg_cache must be one of {REG_CACHE_LEVELS}, "
+                             f"not {reg_cache!r}")
+        self.reg_cache_exclude = set(reg_cache_exclude or ())
+        # Per-run statistics for --reg-cache: functions cached, excluded,
+        # and the sizes of their cached sets.
+        self.reg_cache_stats = {"cached": 0, "excluded": 0, "regs": 0}
         self.owned_function_starts = set()
         self.recovered_function_starts = set()
         self.coalesced_function_starts = set()
@@ -2002,6 +2288,13 @@ class FunctionTranslator:
         if not blocks:
             return None
 
+        # --reg-cache: this function keeps its registers in locals unless it
+        # is excluded. Set before anything is lifted: every emission site
+        # asks the lifter.
+        rc_level = self.reg_cache
+        rc_on = rc_level != "off" and start not in self.reg_cache_exclude
+        self.lifter.reg_cache_on = rc_on
+
         # Get classification and ABI info
         cls_info = self.classification_db.get(start, {})
         category = cls_info.get("category", "unknown")
@@ -2427,7 +2720,8 @@ class FunctionTranslator:
                     and (bb.last_insn.mnemonic in ("ud2", "hlt")
                          or (bb.last_insn.mnemonic == "int3"
                              and bb.last_insn.address not in debug_slide_int3s))):
-                lines.append("    return; /* trap ends recovered control flow */")
+                lines.append(f"    {self.lifter._rcs()}return;"
+                             " /* trap ends recovered control flow */")
 
             lines.append(f"")
 
@@ -2436,7 +2730,7 @@ class FunctionTranslator:
             if fallthrough_target in debug_slide_bypasses.values():
                 lines.append(f"loc_{fallthrough_target:08X}: ;")
             ft_name = self.lifter._call_target_name(fallthrough_target)
-            lines.append(f"    g_seh_ebp = ebp; {ft_name}(); return;"
+            lines.append(f"    {self.lifter._tail_bridge()}{ft_name}(); return;"
                          f" /* fallthrough 0x{fallthrough_target:08X} */")
             lines.append(f"")
 
@@ -2444,7 +2738,7 @@ class FunctionTranslator:
         # The pattern is: optional PUSH32 args, then
         # PUSH32(esp, <retva>); RECOMP_ICALL_SAFE(...).
         # We insert "uint32_t _icall_esp = g_esp;" before the first arg push.
-        lines = _fixup_icall_esp_save(lines)
+        lines = _fixup_icall_esp_save(lines, reg_cache=rc_on)
 
         # Validate: comment out goto targets that reference missing labels
         # (dead code after unconditional jumps may reference non-existent labels)
@@ -2490,6 +2784,15 @@ class FunctionTranslator:
 
         lines.append(f"}}")
         lines.append(f"")
+
+        if rc_level != "off":
+            lines, cached = reg_cache_wrap(lines, name, rc_level, rc_on)
+            if rc_on:
+                self.reg_cache_stats["cached"] += 1
+                self.reg_cache_stats["regs"] += len(cached)
+            else:
+                self.reg_cache_stats["excluded"] += 1
+        self.lifter.reg_cache_on = False
 
         return "\n".join(lines)
 
@@ -2537,11 +2840,15 @@ class BatchTranslator:
                  trace_functions=None, force_returns=None,
                  coalesce_json_paths=None, protected_function_starts=None,
                  icall_sites_json_path=None, spin_waits=None, patches=None,
-                 explicit_guest_bus=False):
+                 explicit_guest_bus=False, reg_cache="off",
+                 reg_cache_exclude=None):
         """spin_waits: a spin_waits.SpinWaitConfig (--spin-waits), or None.
         patches: a patches.PatchConfig (--patches), or None."""
         self.xbe_path = xbe_path
         self.explicit_guest_bus = explicit_guest_bus
+        if reg_cache is True:
+            reg_cache = "full"
+        self.reg_cache = reg_cache or "off"
         # Starts of the seeds a run saw (--seeds, `"observed": true`): the
         # flag-fallback report names its sites in these functions.
         self.observed_seeds = set()
@@ -2604,7 +2911,8 @@ class BatchTranslator:
             seh_prolog=0, seh_epilog=0,
             trace_functions=trace_functions,
             force_returns=force_returns, icall_sites=self.icall_sites,
-            explicit_guest_bus=explicit_guest_bus)
+            explicit_guest_bus=explicit_guest_bus,
+            reg_cache=reg_cache, reg_cache_exclude=reg_cache_exclude)
         if spin_waits is not None:
             from .spin_waits import SpinWaitReport
             self.translator.spin_waits = SpinWaitReport(spin_waits)
@@ -2731,7 +3039,12 @@ class BatchTranslator:
         c_chunks.append('#define RECOMP_GENERATED_CODE')
         if getattr(self, "explicit_guest_bus", False):
             c_chunks.extend(EXPLICIT_GUEST_BUS_PROLOGUE)
+        rc = getattr(self, "reg_cache", "off") != "off"
+        if rc:
+            c_chunks.extend(REG_CACHE_PROLOGUE)
         c_chunks.append('#include "recomp_types.h"')
+        if rc:
+            c_chunks.extend(REG_CACHE_GUARD)
         c_chunks.append('#include <math.h>')
         c_chunks.append("")
         c_chunks.append("/* Forward declarations */")
@@ -3040,7 +3353,16 @@ class BatchTranslator:
                 " */",
                 "",
                 "#define RECOMP_GENERATED_CODE",
-                f'#include "{header_name}"',
+            ]
+            # Per chunk, never in the shared header: recomp_funcs.h is also
+            # included by hand-written code, which uses the globals.
+            rc = getattr(self, "reg_cache", "off") != "off"
+            if rc:
+                c_lines.extend(REG_CACHE_PROLOGUE)
+            c_lines.append(f'#include "{header_name}"')
+            if rc:
+                c_lines.extend(REG_CACHE_GUARD)
+            c_lines += [
                 '#include <math.h>',
                 "",
             ]

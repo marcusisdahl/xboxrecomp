@@ -253,6 +253,10 @@ def main_with_args(argv, allow_container=True):
                          "against their own machine code")
     ap.add_argument("--xbe-limit", type=int, default=40,
                     help="how many candidate functions to take (default 40)")
+    ap.add_argument("--reg-cache", choices=("off", "gpr", "full"),
+                    default="off",
+                    help="lift the corpus functions with tools.recomp "
+                         "--reg-cache at this level (default off)")
     args = ap.parse_args(argv)
 
     vcvars = _find_vcvars()
@@ -478,7 +482,8 @@ def _run_corpus(vcvars, workdir, runtime_inc, args):
         mp = f.read()
 
     lifted, sections, base, missing, addr_of, unlifted = corpus_run.lift_all(
-        dll, mp, ["_" + fn["name"] for fn in fns])
+        dll, mp, ["_" + fn["name"] for fn in fns],
+        reg_cache=getattr(args, "reg_cache", "off"))
     if missing:
         print(nl + "Not found in the linked image (inlined away?): "
               + ", ".join(missing), file=sys.stderr)
@@ -501,7 +506,9 @@ def _run_corpus(vcvars, workdir, runtime_inc, args):
                 print(f"      {line}", file=sys.stderr)
 
     with open(os.path.join(workdir, "corpus_harness.c"), "w") as f:
-        f.write(corpus_run.harness_source(entries, lifted, dll, sections, base, addr_of))
+        f.write(corpus_run.harness_source(
+            entries, lifted, dll, sections, base, addr_of,
+            reg_cache=getattr(args, "reg_cache", "off") != "off"))
     if use_docker:
         # The runtime headers are copied in rather than mounted and passed with
         # /I: an include path has to survive translation into wine's view of the

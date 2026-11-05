@@ -1118,12 +1118,13 @@ def _emit_cond_goto(cond_expr, jcc, desc, target, lifter):
     if lifter and lifter._is_external_target(target):
         # Conditional tail call: same frame bridge as the unconditional tail
         # jmp in _lift_jmp, applied only on the taken path.
+        bridge = lifter._tail_bridge()
         if target in lifter.manual_functions:
-            return (f"if ({cond_expr}) {{ g_seh_ebp = ebp; "
+            return (f"if ({cond_expr}) {{ {bridge}"
                     f"RECOMP_ITAIL(0x{target:08X}u); return; }}"
                     f" /* {jcc}: {desc}, manual tail */")
         name = lifter._call_target_name(target)
-        return (f"if ({cond_expr}) {{ g_seh_ebp = ebp; {name}(); return; }}"
+        return (f"if ({cond_expr}) {{ {bridge}{name}(); return; }}"
                 f" /* {jcc}: {desc} */")
     return f"if ({cond_expr}) goto loc_{target:08X}; /* {jcc}: {desc} */"
 
@@ -1369,7 +1370,8 @@ class Lifter:
     def __init__(self, func_db=None, label_db=None, abi_db=None, xbe_data=None,
                  seh_prolog=None, seh_epilog=None,
                  setjmp_fn=None, longjmp_fn=None, manual_functions=None,
-                 wrapped_functions=None, explicit_guest_bus=False):
+                 wrapped_functions=None, explicit_guest_bus=False,
+                 reg_cache=False):
         """
         func_db: dict of func_addr → func_info (for naming call targets)
         label_db: dict of addr → name (for kernel imports, etc.)
@@ -1385,6 +1387,15 @@ class Lifter:
         self.abi_db = abi_db or {}
         self.xbe_data = xbe_data
         self.explicit_guest_bus = explicit_guest_bus
+        # --reg-cache: the run's level ("off", "gpr", "full"; False and True
+        # are accepted as off and full). reg_cache_on is set per function by
+        # the translator: False for an excluded function, and whenever the
+        # level is off. While it is False every emission is byte-for-byte
+        # what it was before register caching existed.
+        if reg_cache is True:
+            reg_cache = "full"
+        self.reg_cache = reg_cache or "off"
+        self.reg_cache_on = False
         self.manual_functions = set(manual_functions or ())
         self.wrapped_functions = set(wrapped_functions or ())
         self._fp_top = 0  # FPU stack top index
@@ -1439,6 +1450,29 @@ class Lifter:
         # Addresses loaded as immediates into a register inside the current
         # function, used to resolve `jmp <reg>`. See _lift_jmp.
         self.imm_code_refs = set()
+
+    # ── Register caching (--reg-cache) ──
+    #
+    # Under the cache a function keeps the guest registers it uses in C
+    # locals (recomp_types.h, RECOMP_REG_CACHE). The globals must then hold
+    # the values wherever anything but this function's own code can read or
+    # change them: RC_SPILL() writes the locals back before every call, tail
+    # call, return and trace, RC_FILL() reloads them after a call returns.
+    # Both are #defined per function by the translator. With the cache off
+    # these return "", so every emission is exactly what it was before.
+
+    def _rcs(self):
+        """Spill before a boundary: "RC_SPILL(); " or ""."""
+        return "RC_SPILL(); " if self.reg_cache_on else ""
+
+    def _rcf(self):
+        """Fill after a call returns: " RC_FILL();" or ""."""
+        return " RC_FILL();" if self.reg_cache_on else ""
+
+    def _tail_bridge(self):
+        """What goes before every tail call: frame bridge, then the spill.
+        Nothing is refilled after a tail call; the function returns."""
+        return "g_seh_ebp = ebp; " + self._rcs()
 
     def _call_target_name(self, addr):
         """Get the name for a call target address.
@@ -2040,7 +2074,8 @@ class Lifter:
             # yet the pops run *before* that restore, so drift is exactly what
             # breaks them. This is the only point the drift is observable.
             if self.trace_exit_name:
-                return [f'RECOMP_TRACE_ESP("{self.trace_exit_name}", "pop {r}");',
+                return [f'{self._rcs()}RECOMP_TRACE_ESP('
+                        f'"{self.trace_exit_name}", "pop {r}");',
                         f"POP32(esp, {r});"]
             return [f"POP32(esp, {r});"]
         else:
@@ -2527,26 +2562,32 @@ class Lifter:
             # Both keep the guest call as a fallback: a buffer armed by a
             # setjmp that was reached some other way has no native counterpart,
             # and the old behaviour is still better than ignoring the jump.
+            # Under the register cache both are bracketed by a spill and a
+            # fill: recomp_guest_longjmp resumes through the globals, and
+            # after a native longjmp lands here the locals are indeterminate
+            # until the fill reloads them, so the resumed eax goes to g_eax.
+            rcs, rcf = self._rcs(), self._rcf()
+            sj_eax = "g_eax" if self.reg_cache_on else "eax"
             if insn.call_target == self.SETJMP_FN:
                 lines.append(
-                    "{ int _sjv = setjmp(*recomp_setjmp_slot(MEM32(esp)));"
-                    " if (_sjv) { ebp = g_seh_ebp; eax = (uint32_t)_sjv; }"
-                    f" else {{ PUSH32(esp, 0x{ret_va:08X}u); {name}(); }} }}"
-                    f" /* setjmp 0x{insn.call_target:08X} */")
+                    f"{rcs}{{ int _sjv = setjmp(*recomp_setjmp_slot(MEM32(esp)));"
+                    f" if (_sjv) {{ ebp = g_seh_ebp; {sj_eax} = (uint32_t)_sjv; }}"
+                    f" else {{ PUSH32(esp, 0x{ret_va:08X}u); {rcs}{name}(); }} }}"
+                    f"{rcf} /* setjmp 0x{insn.call_target:08X} */")
             elif insn.call_target == self.LONGJMP_FN:
                 lines.append(
-                    "if (!recomp_guest_longjmp(MEM32(esp), MEM32(esp + 4)))"
-                    f" {{ PUSH32(esp, 0x{ret_va:08X}u); {name}(); }}"
-                    f" /* longjmp 0x{insn.call_target:08X} */")
+                    f"{rcs}if (!recomp_guest_longjmp(MEM32(esp), MEM32(esp + 4)))"
+                    f" {{ PUSH32(esp, 0x{ret_va:08X}u); {rcs}{name}(); }}"
+                    f"{rcf} /* longjmp 0x{insn.call_target:08X} */")
             elif insn.call_target in self.manual_functions:
                 # A function the project replaces by hand. recomp_lookup_manual
                 # is consulted on indirect calls, and without this a direct
                 # caller went straight to the generated body and bypassed the
                 # replacement silently. Contributed in #15.
                 lines.append(
-                    f"PUSH32(esp, 0x{ret_va:08X}u); "
+                    f"PUSH32(esp, 0x{ret_va:08X}u); {self._rcs()}"
                     f"RECOMP_ICALL_SAFE(0x{insn.call_target:08X}u, "
-                    "_icall_esp); "
+                    f"_icall_esp);{self._rcf()} "
                     f"/* manual call 0x{insn.call_target:08X} */")
             else:
                 # Routed through RECOMP_ABI_CALL so -DRECOMP_ABI_CHECK covers
@@ -2555,15 +2596,16 @@ class Lifter:
                 # clobbers actually bite -- are almost entirely direct. Expands
                 # to a plain call when the flag is off.
                 lines.append(
-                    f"PUSH32(esp, 0x{ret_va:08X}u); "
-                    f"RECOMP_ABI_CALL(0x{insn.call_target:08X}u, {name}); "
+                    f"PUSH32(esp, 0x{ret_va:08X}u); {self._rcs()}"
+                    f"RECOMP_ABI_CALL(0x{insn.call_target:08X}u, {name});"
+                    f"{self._rcf()} "
                     f"/* call 0x{insn.call_target:08X} */")
             # esp immediately after the callee returns. A per-call delta is the
             # only way to attribute a leak to one callee rather than to the
             # function containing them all.
             if self.trace_exit_name:
                 lines.append(
-                    f'RECOMP_TRACE_ESP("{self.trace_exit_name}", '
+                    f'{self._rcs()}RECOMP_TRACE_ESP("{self.trace_exit_name}", '
                     f'"after call 0x{insn.call_target:08X}");')
             # The SEH helpers exchange the frame pointer with their caller
             # through g_seh_ebp, because ebp is a C local rather than a global.
@@ -2595,10 +2637,13 @@ class Lifter:
             # callback invoked through a stack argument -- is read four bytes
             # low and dispatches through the wrong slot.
             site = insn.address
+            # Under the register cache: one spill after the push, before any
+            # arm; one fill after the whole dispatch.
             head = (f"{{ uint32_t _icall_target = {target}; "
-                    f"PUSH32(esp, 0x{ret_va:08X}u); ")
-            fallback = (f"RECOMP_ICALL_SAFE_AT(_icall_target, _icall_esp, "
-                        f"0x{site:08X}u); }}")
+                    f"PUSH32(esp, 0x{ret_va:08X}u); {self._rcs()}")
+            call = (f"RECOMP_ICALL_SAFE_AT(_icall_target, _icall_esp, "
+                    f"0x{site:08X}u);")
+            rcf = self._rcf()
             recorded = self.icall_site_targets.get(site)
             guards = [t for t in (recorded or [])
                       if t in self.func_db and t not in self.manual_functions]
@@ -2608,9 +2653,9 @@ class Lifter:
                     f"RECOMP_ABI_CALL(0x{t:08X}u, {self._call_target_name(t)}); }}"
                     for t in sorted(set(guards)))
                 return [head + arms + " else { RECOMP_ICALL_GUARD_MISS(); "
-                        + fallback + " }"
+                        + call + " }" + rcf + " }"
                         + f" /* indirect call, guarded {len(set(guards))} */"]
-            return [head + fallback + " /* indirect call */"]
+            return [head + call + rcf + " } /* indirect call */"]
         return ["/* call: no target */"]
 
     def _lift_ret(self, insn, ops):
@@ -2627,7 +2672,8 @@ class Lifter:
         # ret, after the epilogue's pops, so the values are what the caller
         # actually receives.
         if self.trace_exit_name:
-            prefix = (f'RECOMP_TRACE_EXIT("{self.trace_exit_name}", '
+            prefix = (f'{self._rcs()}RECOMP_TRACE_EXIT('
+                      f'"{self.trace_exit_name}", '
                       f'0x{self.func_start:08X}); ') + prefix
         # --force-return: hand the caller a constant instead of what the
         # body computed.
@@ -2642,10 +2688,11 @@ class Lifter:
             prefix = (f'if (g_force_return) eax = '
                       f'0x{self.force_return_value:X}U; ') + prefix
 
+        rcs = self._rcs()
         if len(ops) >= 1 and ops[0].type == "imm":
             n = ops[0].imm
-            return [f"{prefix}esp += {4 + n}; return; /* ret {n} */"]
-        return [f"{prefix}esp += 4; return; /* ret */"]
+            return [f"{prefix}esp += {4 + n}; {rcs}return; /* ret {n} */"]
+        return [f"{prefix}esp += 4; {rcs}return; /* ret */"]
 
     def _forced_tail(self, tail):
         """Apply --force-return to a tail jump.
@@ -2659,9 +2706,12 @@ class Lifter:
         """
         if self.force_return_value is None:
             return tail
+        # The local eax is dead after a tail call (it already spilled), so
+        # under the register cache the constant goes straight to g_eax.
+        reg = "g_eax" if self.reg_cache_on else "eax"
         return tail.replace(
             "; return;",
-            f"; if (g_force_return) eax = 0x{self.force_return_value:X}U;"
+            f"; if (g_force_return) {reg} = 0x{self.force_return_value:X}U;"
             f" return;", 1)
 
     def _is_external_target(self, addr):
@@ -2785,26 +2835,28 @@ class Lifter:
                 # Bridge ebp so the target function can inherit our frame pointer.
                 if insn.jump_target in self.manual_functions:
                     tail = (
-                        f"g_seh_ebp = ebp; "
+                        f"{self._tail_bridge()}"
                         f"RECOMP_ITAIL(0x{insn.jump_target:08X}u); return; "
                         f"/* manual tail jmp 0x{insn.jump_target:08X} */"
                     )
                     if self.trace_exit_name:
                         return [
-                            f'RECOMP_TRACE_ESP("{self.trace_exit_name}", '
+                            f'{self._rcs()}RECOMP_TRACE_ESP('
+                            f'"{self.trace_exit_name}", '
                             f'"tail 0x{insn.jump_target:08X}");',
                             tail,
                         ]
                     return [self._forced_tail(tail)]
                 name = self._call_target_name(insn.jump_target)
-                tail = (f"g_seh_ebp = ebp; {name}(); return; "
+                tail = (f"{self._tail_bridge()}{name}(); return; "
                         f"/* tail jmp 0x{insn.jump_target:08X} */")
                 if self.trace_exit_name:
                     # Tag the exit so a trace says which one was taken. A
                     # function whose paths all look individually balanced can
                     # still leak, and knowing the path is the difference
                     # between measuring and guessing.
-                    return [f'RECOMP_TRACE_ESP("{self.trace_exit_name}", '
+                    return [f'{self._rcs()}RECOMP_TRACE_ESP('
+                            f'"{self.trace_exit_name}", '
                             f'"tail 0x{insn.jump_target:08X}");', tail]
                 return [self._forced_tail(tail)]
             return [f"goto loc_{insn.jump_target:08X};"]
@@ -2817,7 +2869,7 @@ class Lifter:
                 lines = [f"{{ uint32_t _jt = {target_expr}; /* switch: {len(switch_targets)} entries, {len(unique_targets)} targets */"]
                 for t in unique_targets:
                     lines.append(f"if (_jt == 0x{t:08X}u) goto loc_{t:08X};")
-                lines.append(f"g_seh_ebp = ebp; RECOMP_ITAIL(_jt); return; }}")
+                lines.append(f"{self._tail_bridge()}RECOMP_ITAIL(_jt); return; }}")
                 return lines
             # `jmp <reg>` where the register was loaded with an address
             # inside this same function: a hand-written continuation chain,
@@ -2842,11 +2894,12 @@ class Lifter:
                              f" {len(inside)} targets */"]
                     for t in inside:
                         lines.append(f"if (_jt == 0x{t:08X}u) goto loc_{t:08X};")
-                    lines.append("g_seh_ebp = ebp; RECOMP_ITAIL(_jt); return; }")
+                    lines.append(f"{self._tail_bridge()}RECOMP_ITAIL(_jt);"
+                                 " return; }")
                     return lines
             target = _fmt_operand_read(ops[0])
             return [self._forced_tail(
-                f"g_seh_ebp = ebp; RECOMP_ITAIL({target}); return;"
+                f"{self._tail_bridge()}RECOMP_ITAIL({target}); return;"
                 f" /* indirect tail jmp */")]
         return ["/* jmp: no target */"]
 
@@ -2861,7 +2914,8 @@ class Lifter:
             if target:
                 if self._is_external_target(target):
                     name = self._call_target_name(target)
-                    return [f"if ({cond}) {{ g_seh_ebp = ebp; {name}(); return; }} /* {jcc} */"]
+                    return [f"if ({cond}) {{ {self._tail_bridge()}{name}();"
+                            f" return; }} /* {jcc} */"]
                 return [f"if ({cond}) goto loc_{target:08X}; /* {jcc} */"]
             return [f"/* {jcc} - no target */"]
 
@@ -2887,7 +2941,8 @@ class Lifter:
         if target:
             if self._is_external_target(target):
                 name = self._call_target_name(target)
-                return [f"if ({cond} /* {jcc}: {desc} */) {{ g_seh_ebp = ebp; {name}(); return; }}"]
+                return [f"if ({cond} /* {jcc}: {desc} */) {{ "
+                        f"{self._tail_bridge()}{name}(); return; }}"]
             return [f"if ({cond} /* {jcc}: {desc} */) goto loc_{target:08X};"]
         return [f"/* {jcc}: {desc} - no target */"]
 

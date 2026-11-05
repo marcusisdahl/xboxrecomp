@@ -43,7 +43,7 @@ _READ = {
 }
 
 
-def lift_all(dll_bytes, map_text, wanted):
+def lift_all(dll_bytes, map_text, wanted, reg_cache="off"):
     """Lift each wanted function, following calls into whatever they reach.
 
     A corpus function that calls a CRT helper needs that helper lifted too --
@@ -84,7 +84,8 @@ def lift_all(dll_bytes, map_text, wanted):
             [config.Section(s.name, s.va, s.vsize, s.raw_off, s.raw_size,
                             s.is_code) for s in sections],
             entry_point=base, kernel_thunk_addr=base, origin="conformance-corpus")
-        translator = FunctionTranslator(dll_bytes, func_db)
+        translator = FunctionTranslator(dll_bytes, func_db,
+                                        reg_cache=reg_cache)
 
         todo = [n for n in wanted if n in extents]
         missing = [n for n in wanted if n not in extents]
@@ -249,10 +250,20 @@ def _section_blob(dll_bytes, sections, base):
     return chr(10).join(out)
 
 
-def harness_source(entries, lifted, dll_bytes, sections, base, addr_of):
-    """entries: corpus Fn dicts under test. lifted: ordered [(symbol, C)]."""
+def harness_source(entries, lifted, dll_bytes, sections, base, addr_of,
+                   reg_cache=False):
+    """entries: corpus Fn dicts under test. lifted: ordered [(symbol, C)].
+    reg_cache: the bodies were lifted with --reg-cache, so the harness
+    switches recomp_types.h to the cached register names."""
     # includes first, then the image arrays, then the code that uses them
-    out = [_PREAMBLE, _section_blob(dll_bytes, sections, base),
+    pre = _PREAMBLE
+    if reg_cache:
+        nl = chr(10)
+        pre = pre.replace("#define RECOMP_GENERATED_CODE 1" + nl,
+                          "#define RECOMP_GENERATED_CODE 1" + nl
+                          + "#define RECOMP_REG_CACHE 1" + nl, 1)
+        assert "RECOMP_REG_CACHE" in pre
+    out = [pre, _section_blob(dll_bytes, sections, base),
            _PREAMBLE_TAIL]
     for fn in entries:
         s = _SIG[fn["sig"]]

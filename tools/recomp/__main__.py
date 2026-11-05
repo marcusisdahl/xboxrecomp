@@ -86,6 +86,31 @@ def _load_addrs(path):
     return out
 
 
+def _resolve_reg_cache(choice, explicit_guest_bus):
+    """--reg-cache auto/off/gpr/full -> the level the translator uses.
+
+    auto is off for now: the cached output is opt-in until it has been
+    compared against the uncached build on a real run."""
+    if choice == "auto":
+        return "off"
+    return choice
+
+
+def _parse_va_list(spec):
+    """--reg-cache-exclude: "VA,VA" or "@file" -> a set of ints."""
+    if not spec:
+        return set()
+    if spec.startswith("@"):
+        with open(spec[1:], "r", encoding="utf-8") as fh:
+            text = "\n".join(line.split("#", 1)[0] for line in fh)
+    else:
+        text = spec
+    out = set()
+    for tok in text.replace(",", " ").split():
+        out.add(int(tok, 16))
+    return out
+
+
 def _load_manual_protection(manual_functions, exclude_manual):
     """Load manual entry points before any destructive boundary repair."""
     protected = _load_addrs(manual_functions)
@@ -287,7 +312,37 @@ def main():
                              "Requires C++ and an explicit guest-bus host; "
                              "does not provide a complete big-endian runtime")
 
+    parser.add_argument("--reg-cache", choices=("auto", "off", "gpr", "full"),
+                        default="auto",
+                        help="Keep guest registers in function locals instead "
+                             "of the TLS globals, spilled and refilled around "
+                             "calls and returns (recomp_types.h, "
+                             "RECOMP_REG_CACHE). gpr: eax..edi; full: also "
+                             "mm0-7 and xmm0-7; off: unchanged output. auto "
+                             "is currently off. -DRECOMP_REG_CACHE_OFF "
+                             "compiles cached output with the globals")
+    parser.add_argument("--reg-cache-exclude", metavar="VA[,VA...]|@FILE",
+                        help="Functions emitted uncached under --reg-cache "
+                             "(escape hatch for a compiler that fails on one); "
+                             "@FILE lists VAs separated by commas or "
+                             "whitespace, # starts a comment")
+    parser.add_argument("--reg-cache-spill", choices=("all", "dirty"),
+                        default="all",
+                        help="Registers written back at a spill: all cached "
+                             "ones (default). dirty is not implemented yet")
+
     args = parser.parse_args()
+
+    reg_cache = _resolve_reg_cache(args.reg_cache, args.explicit_guest_bus)
+    if args.reg_cache_spill != "all":
+        print("ERROR: --reg-cache-spill dirty is not implemented yet",
+              file=sys.stderr)
+        sys.exit(1)
+    try:
+        reg_cache_exclude = _parse_va_list(args.reg_cache_exclude)
+    except (OSError, ValueError) as e:
+        print(f"ERROR: --reg-cache-exclude: {e}", file=sys.stderr)
+        sys.exit(1)
 
     patches = None
     if args.patches:
@@ -374,6 +429,8 @@ def main():
         spin_waits=spin_waits,
         patches=patches,
         explicit_guest_bus=args.explicit_guest_bus,
+        reg_cache=reg_cache,
+        reg_cache_exclude=reg_cache_exclude,
     )
     translator.observed_seeds = _load_observed_seeds(args.seeds)
 
@@ -549,6 +606,12 @@ def main():
             print(f"{stats['unresolved_stubs']} unresolved call targets stubbed "
                   f"(addresses called but not detected as functions)",
                   file=sys.stderr)
+        if reg_cache != "off":
+            rs = translator.translator.reg_cache_stats
+            avg = rs["regs"] / rs["cached"] if rs["cached"] else 0.0
+            print(f"Register cache ({reg_cache}): {rs['cached']} functions "
+                  f"cached, {rs['excluded']} excluded, {avg:.1f} registers "
+                  f"per cached function", file=sys.stderr)
         _report_unimplemented(stats)
         for f_path in stats.get("files", []):
             print(f"  {f_path}", file=sys.stderr)
