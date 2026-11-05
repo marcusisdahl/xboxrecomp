@@ -1405,7 +1405,7 @@ extern volatile uint64_t g_icall_guard_misses;
     /* Skip garbage VAs outside code section + kernel thunk range */ \
     if (!RECOMP_ICALL_IS_CODE(_va)) { \
         recomp_icall_not_code_log(_va); \
-        g_esp += 4; eax = 0; break; \
+        g_esp += 4; g_eax = 0; break; \
     } \
     recomp_func_t _fn = recomp_lookup_manual(_va); \
     if (!_fn) _fn = recomp_lookup(_va); \
@@ -1413,7 +1413,7 @@ extern volatile uint64_t g_icall_guard_misses;
     if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
                RECOMP_ABI_CALL(_va, _fn); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
-           recomp_icall_fail_log(_va); g_esp += 4; eax = 0; } \
+           recomp_icall_fail_log(_va); g_esp += 4; g_eax = 0; } \
 } while(0)
 
 /**
@@ -1431,7 +1431,7 @@ extern volatile uint64_t g_icall_guard_misses;
     g_icall_count++; \
     if (!RECOMP_ICALL_IS_CODE(_va)) { \
         recomp_icall_not_code_log(_va); \
-        g_esp = (saved_esp); eax = 0; break; \
+        g_esp = (saved_esp); g_eax = 0; break; \
     } \
     recomp_func_t _fn = recomp_lookup_manual(_va); \
     if (!_fn) _fn = recomp_lookup(_va); \
@@ -1439,7 +1439,7 @@ extern volatile uint64_t g_icall_guard_misses;
     if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
                RECOMP_ABI_CALL(_va, _fn); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
-           recomp_icall_fail_log(_va); g_esp = (saved_esp); eax = 0; } \
+           recomp_icall_fail_log(_va); g_esp = (saved_esp); g_eax = 0; } \
 } while(0)
 
 /**
@@ -1457,7 +1457,7 @@ extern volatile uint64_t g_icall_guard_misses;
     g_icall_count++; \
     if (!RECOMP_ICALL_IS_CODE(_va)) { \
         recomp_icall_not_code_log(_va); \
-        g_esp = (saved_esp); eax = 0; break; \
+        g_esp = (saved_esp); g_eax = 0; break; \
     } \
     RECOMP_ICALL_OBSERVE_SITE((site), _va); \
     recomp_func_t _fn = recomp_lookup_manual(_va); \
@@ -1466,7 +1466,7 @@ extern volatile uint64_t g_icall_guard_misses;
     if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
                RECOMP_ABI_CALL(_va, _fn); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
-           recomp_icall_fail_log(_va); g_esp = (saved_esp); eax = 0; } \
+           recomp_icall_fail_log(_va); g_esp = (saved_esp); g_eax = 0; } \
 } while(0)
 
 /**
@@ -1497,9 +1497,57 @@ extern volatile uint64_t g_icall_guard_misses;
  *
  * Only active when RECOMP_GENERATED_CODE is defined (in generated
  * .c files) to avoid polluting hand-written code.
+ *
+ * Register caching (tools.recomp --reg-cache). A chunk generated with it
+ * defines RECOMP_REG_CACHE before including this header, and then each
+ * function keeps the registers it uses in C locals rc_eax.., rc_mm0..,
+ * rc_xmm0..: the names below map there instead of to the TLS globals.
+ * Every TLS access is a load or store through the thread pointer, and on a
+ * host without store forwarding (Xenon) the compiler has to reload them
+ * after every guest store, because a store through a pointer may alias a
+ * global. A local whose address is never taken stays in a host register.
+ *
+ * The lifter declares the locals at function entry (filled from the
+ * globals: RC_DECL_*), writes them back before anything that can read the
+ * globals (RC_SPILL: calls, indirect calls, tail calls, returns, traces) and
+ * reloads them after a call returns (RC_FILL). RC_SPILL and RC_FILL are
+ * #defined per function, just before it, to list exactly the registers that
+ * function caches, and #undef'd after it.
+ *
+ * There is no global named rc_*, so a use the lifter did not declare is a
+ * compile error, never a silent read of a stale value. -DRECOMP_REG_CACHE_OFF
+ * compiles the same generated code with the globals, as without the flag.
+ *
+ * Header macros must never name a register bare (eax, esp): under the cache
+ * that would be the calling function's local. They use g_eax, g_esp.
  * ================================================================ */
 
 #ifdef RECOMP_GENERATED_CODE
+#define RECOMP_REG_CACHE_SUPPORTED 1
+#if defined(RECOMP_REG_CACHE) && !defined(RECOMP_REG_CACHE_OFF)
+#define RC_ACTIVE 1
+#define eax rc_eax
+#define ecx rc_ecx
+#define edx rc_edx
+#define esp rc_esp
+#define ebx rc_ebx
+#define esi rc_esi
+#define edi rc_edi
+/* Operands of ## are not macro-expanded, so RC_S(eax) is always
+ * `g_eax = rc_eax;` whatever eax maps to. */
+#define RC_DECL_GPR(r) uint32_t  rc_##r = g_##r;
+#define RC_DECL_MMX(r) RecompMmx rc_##r = g_##r;
+#define RC_DECL_XMM(r) RecompXmm rc_##r = g_##r;
+#define RC_S(r) g_##r = rc_##r;
+#define RC_L(r) rc_##r = g_##r;
+/* The spin wait may run interrupt service routines on this thread's
+ * registers (the desktop kernel_hal does), so the globals must be current
+ * around it. It only calls out while the thread sleeps or an IRQ waits. */
+#undef RECOMP_SPIN_WAIT
+#define RECOMP_SPIN_WAIT(va) \
+    do { if (g_xbox_spin_sleep | g_xbox_irq_pending) { \
+        RC_SPILL(); xbox_SpinWait(va); RC_FILL(); } } while (0)
+#else
 #define eax g_eax
 #define ecx g_ecx
 #define edx g_edx
@@ -1507,6 +1555,12 @@ extern volatile uint64_t g_icall_guard_misses;
 #define ebx g_ebx
 #define esi g_esi
 #define edi g_edi
+#define RC_DECL_GPR(r)
+#define RC_DECL_MMX(r)
+#define RC_DECL_XMM(r)
+#define RC_S(r)
+#define RC_L(r)
+#endif
 
 /* ================================================================
  * MMX register file
@@ -2107,6 +2161,25 @@ RECOMP_MQ_FN RecompMmx MMX_PSADBW(RecompMmx a, RecompMmx b) {
 }
 #endif /* RECOMP_MMX_SHIFT_LANES */
 
+/* SSE and MMX register names: the same two mappings as the GPRs above. */
+#ifdef RC_ACTIVE
+#define xmm0 rc_xmm0
+#define xmm1 rc_xmm1
+#define xmm2 rc_xmm2
+#define xmm3 rc_xmm3
+#define xmm4 rc_xmm4
+#define xmm5 rc_xmm5
+#define xmm6 rc_xmm6
+#define xmm7 rc_xmm7
+#define mm0 rc_mm0
+#define mm1 rc_mm1
+#define mm2 rc_mm2
+#define mm3 rc_mm3
+#define mm4 rc_mm4
+#define mm5 rc_mm5
+#define mm6 rc_mm6
+#define mm7 rc_mm7
+#else
 #define xmm0 g_xmm0
 #define xmm1 g_xmm1
 #define xmm2 g_xmm2
@@ -2123,6 +2196,7 @@ RECOMP_MQ_FN RecompMmx MMX_PSADBW(RecompMmx a, RecompMmx b) {
 #define mm5 g_mm5
 #define mm6 g_mm6
 #define mm7 g_mm7
+#endif
 /* ebp is NOT global - it's local in each function.
  * For __SEH_prolog/epilog, use g_seh_ebp to bridge. */
 #endif
