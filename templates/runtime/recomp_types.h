@@ -873,9 +873,10 @@ static inline RecompXmm XMM_SCALAR_BITS(uint32_t bits) {
  * access. Done lane-wise, which is also unaligned-safe for movups. */
 
 #if defined(RECOMP_EXPLICIT_GUEST_BUS)
-/* One fast-table lookup for all 16 bytes when they are plain RAM in one
- * page (recomp_guest_ref.h), else the four MEM32 accesses out of line; the
- * same four dword accesses either way. */
+/* One fast-table lookup for all 16 bytes when they are plain RAM that the
+ * fast path takes (recomp_guest_ref.h: a listed page; on big-endian hosts
+ * also not crossing into the next page), else the four MEM32 accesses out
+ * of line; the same four dword accesses either way. */
 XR_REF_NOINLINE inline RecompXmm recomp_xmm_mem_slow(uint32_t addr) {
     RecompXmm r;
     r.u[0] = MEM32(addr);      r.u[1] = MEM32(addr + 4);

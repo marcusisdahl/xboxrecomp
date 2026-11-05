@@ -5,8 +5,10 @@
 #   x64 explicit-bus  -- no MMX intrinsics on x64; hashes only
 #   x64 flat
 #   x86/x64 shift     -- explicit bus with RECOMP_MMX_SHIFT_LANES=1 and
-#                        RECOMP_XMM_SCALAR_PROXY=1, the helper variants the
-#                        big-endian build uses, checked against the CPU on x86
+#                        RECOMP_XMM_SCALAR_PROXY=1 (and page-crossing
+#                        accesses off the fast path, XR_GUEST_FAST_PAGE_CROSS=0),
+#                        the variants the big-endian build uses, checked
+#                        against the CPU on x86
 #                        like the others
 # All six must print identical case hashes; the x86 explicit-bus output is the
 # golden file the big-endian (Xbox 360) run is compared against
@@ -36,7 +38,7 @@ foreach ($arch in @('x86', 'x64')) {
         $exe = Join-Path $OutDir "$name.exe"
         $objDir = Join-Path $OutDir "$name.obj"
         New-Item -ItemType Directory -Force $objDir | Out-Null
-        $defs = if ($mode -eq 'flat') { '/DSIMD_LANES_FLAT' } elseif ($mode -eq 'shift') { '/DRECOMP_MMX_SHIFT_LANES=1 /DRECOMP_XMM_SCALAR_PROXY=1' } else { '' }
+        $defs = if ($mode -eq 'flat') { '/DSIMD_LANES_FLAT' } elseif ($mode -eq 'shift') { '/DRECOMP_MMX_SHIFT_LANES=1 /DRECOMP_XMM_SCALAR_PROXY=1 /DXR_GUEST_FAST_PAGE_CROSS=0' } else { '' }
         $extra = if ($mode -eq 'flat') { '' } else { $bus }
         $cmd = "`"$vcvars`" $arch >nul && cl $common $defs /Fo`"$objDir\\`" /Fe`"$exe`" `"$src`" $extra"
         $ErrorActionPreference = 'Continue'

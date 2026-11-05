@@ -212,12 +212,49 @@ BENCH_NOINLINE static uint64_t b_device32(uint32_t)
     for (unsigned i = 0; i < kOps / 4; ++i) sum += MEM32(0xFD000000u + ((i * 4u) & 0xFFu));
     return sum;
 }
+/* Page-crossing accesses. Each straddles a 4 KiB page whose successor is
+ * contiguous RAM, so the page is listed: with XR_GUEST_FAST_PAGE_CROSS 1
+ * (little-endian default) this is the fast path issuing one wide access
+ * across the page; with 0 (big-endian default) the out-of-line normal path,
+ * which never issues a wide access across a page. */
 BENCH_NOINLINE static uint64_t b_cross32(uint32_t base)
 {
-    /* Straddles a 4 KiB page each time: always the out-of-line path. */
     uint64_t sum = 0;
     for (unsigned i = 0; i < kOps / 4; ++i) sum += MEM32(base + 0xFFEu + ((i & 3u) << 12));
     return sum;
+}
+BENCH_NOINLINE static uint64_t b_cross_store32(uint32_t base)
+{
+    for (unsigned i = 0; i < kOps / 4; ++i) MEM32(base + 0xFFDu + ((i & 3u) << 12)) = i * 0x01010101u;
+    return MEM32(base + 0xFFDu) + (uint64_t)MEM32(base + 0x3FFDu);
+}
+BENCH_NOINLINE static uint64_t b_cross_store16(uint32_t base)
+{
+    for (unsigned i = 0; i < kOps / 4; ++i) MEM16(base + 0xFFFu + ((i & 3u) << 12)) = (uint16_t)(i * 0x0101u);
+    return MEM16(base + 0xFFFu) + (uint64_t)MEM16(base + 0x3FFFu);
+}
+BENCH_NOINLINE static uint64_t b_cross_xmm(uint32_t base)
+{
+    /* 16 bytes from 0x...FFA: the dword at 0x...FFE crosses the page */
+    for (unsigned i = 0; i < kOps / 16; ++i) {
+        uint32_t a = base + 0xFFAu + ((i & 3u) << 12);
+        RecompXmm x = XMM_MEM(a);
+        x.u[1] += 1u;
+        XMM_STORE(a, x);
+    }
+    return MEM32(base + 0xFFAu) + (uint64_t)MEM32(base + 0xFFEu);
+}
+/* Unaligned, crossing a 128-byte cache line but not a page: always fast. */
+BENCH_NOINLINE static uint64_t b_line32(uint32_t base)
+{
+    uint64_t sum = 0;
+    for (unsigned i = 0; i < kOps / 4; ++i) sum += MEM32(base + 0x7Eu + ((i * 0x100u) & (SPAN - 1)));
+    return sum;
+}
+BENCH_NOINLINE static uint64_t b_line_store32(uint32_t base)
+{
+    for (unsigned i = 0; i < kOps / 4; ++i) MEM32(base + 0x7Eu + ((i * 0x100u) & (SPAN - 1))) = i;
+    return MEM32(base + 0x7Eu) + (uint64_t)MEM32(base + SPAN - 0x82u);
 }
 static volatile double s_fp_in[256];
 BENCH_NOINLINE static uint64_t b_fist(uint32_t)
@@ -339,7 +376,12 @@ int main(int argc, char **argv)
         { "mmx_load", b_mmx, BASE, kOps / 2 },
         { "watch32_slow", b_watch32, 0, kOps / 4 },
         { "device32_slow", b_device32, 0, kOps / 4 },
-        { "pagecross32_slow", b_cross32, BASE, kOps / 4 },
+        { "pagecross32", b_cross32, BASE, kOps / 4 },
+        { "pagecross_store32", b_cross_store32, BASE + 0x4000u, kOps / 4 },
+        { "pagecross_store16", b_cross_store16, BASE + 0x4000u, kOps / 4 },
+        { "pagecross_xmm", b_cross_xmm, BASE + 0x8000u, kOps / 16 },
+        { "linecross32", b_line32, BASE, kOps / 4 },
+        { "linecross_store32", b_line_store32, BASE + 0xB000u, kOps / 4 },
         { "fist_nearest", b_fist, 0, kOps },
         { "fist_trunc", b_fist_trunc, 0, kOps },
         { "frndint_rc", b_frndint, 0, kOps },

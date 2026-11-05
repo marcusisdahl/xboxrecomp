@@ -14,11 +14,14 @@
 typedef void (*SimdLanesLog)(const char *line);
 
 /* Results of one run. ref_* count the cases checked against the host's own
- * MMX/SSE instructions (x86 builds only; 0 elsewhere). */
+ * MMX/SSE instructions (x86 builds only; 0 elsewhere). place_failed counts
+ * the cases whose outputs differ between the guest-memory placements
+ * (simd_lanes.cpp: fast path, page-crossing, normal path). */
 typedef struct SimdLanesResult {
     unsigned cases;
     unsigned ref_checked;
     unsigned ref_failed;
+    unsigned place_failed;
 } SimdLanesResult;
 
 /* Writes one "case <name> <hash>" line per case, then a summary line.

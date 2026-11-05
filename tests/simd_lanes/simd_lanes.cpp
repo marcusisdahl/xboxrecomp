@@ -55,14 +55,32 @@ void xr_guest_access_fault(XrGuestStatus s, uint32_t a, unsigned w)
 }
 #endif
 
-/* Guest layout: inputs a|b|c contiguous at VA_IN, output at VA_OUT. */
+/* Guest layout: inputs a|b|c contiguous at VA_IN, output at VA_OUT. Three
+ * pages of RAM, so with the explicit bus the fast-page table
+ * (recomp_guest_ref.h) lists pages 0x10 and 0x11 (each followed by RAM) but
+ * not 0x12 (the last). Each case runs at three placements (kPlace): the
+ * main one in a listed page (the inline fast path, as most generated
+ * accesses), the data straddling page boundaries (a page-crossing access is
+ * fast on little-endian hosts, the normal path on big-endian ones), and in
+ * the unlisted last page (the out-of-line xr_guest_load/xr_guest_store
+ * path). The printed hashes are the main placement's; the other two must
+ * give the same bytes. */
 #define GUEST_BASE 0x00010000u
-#define GUEST_SIZE 0x1000u
-#define VA_IN  (GUEST_BASE + 0x100u)
+#define GUEST_SIZE 0x3000u
+static uint32_t s_va_in = GUEST_BASE + 0x100u, s_va_out = GUEST_BASE + 0x200u;
+#define VA_IN  (s_va_in)
 #define VA_A   (VA_IN)
 #define VA_B   (VA_IN + 16u)
 #define VA_C   (VA_IN + 32u)
-#define VA_OUT (GUEST_BASE + 0x200u)
+#define VA_OUT (s_va_out)
+struct Place { const char *name; uint32_t in, out; };
+static const Place kPlace[] = {
+    { "listed page", GUEST_BASE + 0x0100u, GUEST_BASE + 0x0200u },
+    /* a|b|c from 0x10FE8: b and the unaligned XMM/MMX loads cross into page
+     * 0x11; the output from 0x11FFE: its first dword crosses into 0x12 */
+    { "page-crossing", GUEST_BASE + 0x0FE8u, GUEST_BASE + 0x1FFEu },
+    { "unlisted page", GUEST_BASE + 0x2100u, GUEST_BASE + 0x2200u },
+};
 static uint8_t s_ram[GUEST_SIZE];
 #if !defined(SIMD_LANES_FLAT)
 static XrGuestBus s_bus;
@@ -513,7 +531,7 @@ static void hex(char *dst, const uint8_t *p, int n)
 SimdLanesResult simd_lanes_run(SimdLanesLog log, unsigned char *dump,
                                size_t dump_cap, size_t *dump_len)
 {
-    SimdLanesResult res = { 0, 0, 0 };
+    SimdLanesResult res = { 0, 0, 0, 0 };
     size_t used = 0;
     unsigned k;
     char line[256];
@@ -542,11 +560,26 @@ SimdLanesResult simd_lanes_run(SimdLanesLog log, unsigned char *dump,
     log(line);
     if (host_be != RECOMP_HOST_BIG_ENDIAN) log("FAIL RECOMP_HOST_BIG_ENDIAN does not match the host");
 
+#if !defined(SIMD_LANES_FLAT)
+    /* Say which path each placement takes, so a run shows the fast path was
+     * really exercised (16 bytes at the output, as XMM_STORE resolves them). */
+    for (k = 0; k < sizeof kPlace / sizeof kPlace[0]; k++) {
+        lanes_snprintf(line, sizeof line, "placement %u (%s): in 0x%05X %s, out 0x%05X %s", k, kPlace[k].name,
+                       (unsigned)kPlace[k].in, xr_guest_fast_ptr(kPlace[k].in, 16) ? "fast" : "normal",
+                       (unsigned)kPlace[k].out, xr_guest_fast_ptr(kPlace[k].out, 16) ? "fast" : "normal");
+        log(line);
+    }
+#endif
+    unsigned place_diff = 0;
     for (k = 0; k < sizeof kCases / sizeof kCases[0]; k++) {
         const Case *cs = &kCases[k];
-        uint64_t h = 14695981039346656037ULL;
-        unsigned it, mism = 0;
+        uint64_t h = 14695981039346656037ULL, h_main = 0;
+        unsigned it, mism = 0, pl;
+        int place_bad = 0;
         Ctx c;
+        for (pl = 0; pl < sizeof kPlace / sizeof kPlace[0]; pl++) {
+        h = 14695981039346656037ULL;
+        s_va_in = kPlace[pl].in; s_va_out = kPlace[pl].out;
         s_rng = 0x9E3779B97F4A7C15ULL ^ ((uint64_t)fnv32(cs->name) << 1) ^ 1u;
         for (it = 0; it < SIMD_LANES_ITER; it++) {
             uint8_t got[16];
@@ -561,6 +594,7 @@ SimdLanesResult simd_lanes_run(SimdLanesLog log, unsigned char *dump,
             memcpy(got, s_ram + (VA_OUT - GUEST_BASE), 16);
             canon(got, cs->outk);
             for (i = 0; i < 16; i++) { h ^= got[i]; h *= 1099511628211ULL; }
+            if (pl) continue;   /* the other placements only compare hashes */
             if (dump && used + 16 <= dump_cap) { memcpy(dump + used, got, 16); used += 16; }
 #if defined(SIMD_LANES_REF)
             if (cs->ref) {
@@ -579,19 +613,36 @@ SimdLanesResult simd_lanes_run(SimdLanesLog log, unsigned char *dump,
             }
 #endif
         }
+        if (!pl) h_main = h;
+        else if (h != h_main) {
+            place_bad = 1;
+            lanes_snprintf(line, sizeof line, "  PLACEMENT DIFF %s: %s %08X%08X, %s %08X%08X", cs->name,
+                           kPlace[0].name, (unsigned)(h_main >> 32), (unsigned)h_main,
+                           kPlace[pl].name, (unsigned)(h >> 32), (unsigned)h);
+            log(line);
+        }
+        }
+        h = h_main;
+        s_va_in = kPlace[0].in; s_va_out = kPlace[0].out;
+        if (place_bad) place_diff++;
         if (cs->ref && SIMD_LANES_REF_ON) {
             res.ref_checked++;
             if (mism) res.ref_failed++;
         }
-        lanes_snprintf(line, sizeof line, "case %-22s %08X%08X%s", cs->name,
+        lanes_snprintf(line, sizeof line, "case %-22s %08X%08X%s%s", cs->name,
                        (unsigned)(h >> 32), (unsigned)h,
-                       !(cs->ref && SIMD_LANES_REF_ON) ? "" : mism ? "  ref:FAIL" : "  ref:ok");
+                       !(cs->ref && SIMD_LANES_REF_ON) ? "" : mism ? "  ref:FAIL" : "  ref:ok",
+                       place_bad ? "  placement:FAIL" : "");
         log(line);
         res.cases++;
     }
     lanes_snprintf(line, sizeof line, "simd_lanes: %u cases, %u checked against x86 instructions, %u ref failures",
                    res.cases, res.ref_checked, res.ref_failed);
     log(line);
+    lanes_snprintf(line, sizeof line, "simd_lanes: %u placements per case, %u cases differ between placements",
+                   (unsigned)(sizeof kPlace / sizeof kPlace[0]), place_diff);
+    log(line);
+    res.place_failed = place_diff;
     if (dump_len) *dump_len = used;
     return res;
 }
@@ -608,6 +659,6 @@ int main(int argc, char **argv)
         if (!f || fwrite(dump, 1, len, f) != len) { puts("could not write dump"); return 2; }
         fclose(f);
     }
-    return r.ref_failed ? 1 : 0;
+    return r.ref_failed || r.place_failed ? 1 : 0;
 }
 #endif

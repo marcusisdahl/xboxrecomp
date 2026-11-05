@@ -43,7 +43,8 @@ template<> struct XrGuestStorage<8> { typedef uint64_t Type; };
  * fast table lists for the bus it was built for (recomp_guest_bus.h) -- is a
  * direct little-endian load or store. Everything else (devices, the host's
  * watch pages, unmapped or read-only memory, accesses that start in the last
- * page before any of those, another bus, no bus) takes xr_guest_load/
+ * page before any of those, on big-endian hosts any access that crosses a
+ * page boundary (XR_GUEST_FAST_PAGE_CROSS), another bus, no bus) takes xr_guest_load/
  * xr_guest_store out of line, unchanged. The accesses are volatile like the
  * bytewise RAM path's (guest spin loops re-read memory) and need no alignment.
  *
@@ -71,7 +72,8 @@ template<> struct XrGuestStorage<8> { typedef uint64_t Type; };
 /* The fast-path test: page is xr_guest_fast_page[va >> 12], on the bus the
  * table describes. A listed page is followed by contiguous RAM, so `bytes`
  * (1..XR_GUEST_FAST_PAGE_SIZE) at va need no bounds check even when they
- * reach into the next page.
+ * reach into the next page -- but see XR_GUEST_FAST_PAGE_CROSS below for
+ * hosts where such an access must not be issued as one wide access.
  *
  * XR_GUEST_FAST_ONE_BUS (opt-in, define it for every unit that includes
  * this header) drops the per-access check of the thread's bus: a host that
@@ -85,20 +87,15 @@ template<> struct XrGuestStorage<8> { typedef uint64_t Type; };
 #else
 #define XR_GUEST_FAST_BUS_OK() (g_recomp_guest_bus == xr_guest_fast_bus)
 #endif
-#define XR_GUEST_FAST_OK(page, va, bytes) ((page) && XR_GUEST_FAST_BUS_OK())
 #define XR_GUEST_FAST_AT(page, va) ((page) + ((va) & (XR_GUEST_FAST_PAGE_SIZE - 1)))
-
-/* Host pointer for `bytes` at va, or NULL for the normal path. */
-XR_REF_INLINE uint8_t *xr_guest_fast_ptr(uint32_t va, unsigned bytes)
-{
-    uint8_t *page = xr_guest_fast_page[va >> XR_GUEST_FAST_PAGE_SHIFT];
-    (void)bytes;   /* any size up to a page: a listed page is followed by RAM */
-    return XR_GUEST_FAST_OK(page, va, bytes) ? XR_GUEST_FAST_AT(page, va) : 0;
-}
 
 #if defined(_XBOX) && !defined(_M_IX86) && !defined(_M_X64)
 /* Xbox 360 (big-endian PowerPC): lhbrx/lwbrx/sthbrx/stwbrx. Xenon handles
- * unaligned cacheable integer accesses in hardware. */
+ * an unaligned cacheable integer access in hardware while it stays inside
+ * one 4 KiB page (measured: an unaligned load32 that crosses a 128-byte
+ * cache line costs about 20 ns more, nothing otherwise), but one that
+ * crosses a page takes an alignment trap (about 170 ns). Such accesses are
+ * kept off the fast path (XR_GUEST_FAST_PAGE_CROSS 0, below). */
 #include <ppcintrinsics.h>
 #define XR_REF_LD16(p) ((uint16_t)__loadvolatileshortbytereverse(0, (p)))
 #define XR_REF_LD32(p) ((uint32_t)__loadvolatilewordbytereverse(0, (p)))
@@ -140,6 +137,37 @@ typedef uint64_t XrRefU64 __attribute__((aligned(1), may_alias));
 #define XR_REF_LD64(p) ((uint64_t)XR_REF_LD32(p) | ((uint64_t)XR_REF_LD32((p) + 4) << 32))
 #define XR_REF_ST64(p, v) (XR_REF_ST32((p), (uint32_t)(v)), XR_REF_ST32((p) + 4, (uint32_t)((uint64_t)(v) >> 32)))
 #endif
+
+/* XR_GUEST_FAST_PAGE_CROSS: 1 lets an access that starts in a listed page
+ * and ends in the next one take the fast path (one wide access across the
+ * page boundary: fine on x86/x64/ARM); 0 sends it to the normal, bytewise
+ * path, so no wide access ever crosses a page. Default: 1 on little-endian
+ * hosts (unchanged behaviour), 0 elsewhere (the Xbox 360, see above). The
+ * test is then one more compare per access: va's offset in its page is at
+ * most 4096 - bytes. A host may define it either way. */
+#if !defined(XR_GUEST_FAST_PAGE_CROSS)
+#if defined(XR_REF_LE_HOST)
+#define XR_GUEST_FAST_PAGE_CROSS 1
+#else
+#define XR_GUEST_FAST_PAGE_CROSS 0
+#endif
+#endif
+#if XR_GUEST_FAST_PAGE_CROSS
+#define XR_GUEST_FAST_SPAN_OK(va, bytes) 1
+#else
+#define XR_GUEST_FAST_SPAN_OK(va, bytes) \
+    ((bytes) == 1 || ((va) & (XR_GUEST_FAST_PAGE_SIZE - 1)) <= XR_GUEST_FAST_PAGE_SIZE - (bytes))
+#endif
+#define XR_GUEST_FAST_OK(page, va, bytes) ((page) && XR_GUEST_FAST_SPAN_OK(va, bytes) && XR_GUEST_FAST_BUS_OK())
+
+/* Host pointer for `bytes` (1..XR_GUEST_FAST_PAGE_SIZE) at va, or NULL for
+ * the normal path. */
+XR_REF_INLINE uint8_t *xr_guest_fast_ptr(uint32_t va, unsigned bytes)
+{
+    uint8_t *page = xr_guest_fast_page[va >> XR_GUEST_FAST_PAGE_SHIFT];
+    (void)bytes;
+    return XR_GUEST_FAST_OK(page, va, bytes) ? XR_GUEST_FAST_AT(page, va) : 0;
+}
 
 template<unsigned N> struct XrGuestRaw;
 template<> struct XrGuestRaw<1> {

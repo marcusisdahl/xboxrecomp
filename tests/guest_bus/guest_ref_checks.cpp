@@ -146,6 +146,60 @@ static void device_counts()
           s_mem[0].dev_writes == 1);
 }
 
+/* Which path an access takes at the end of a listed page. Page 0x10's table
+ * entry is pointed at a decoy copy for the duration: the fast path reads
+ * and writes the decoy, the normal path the mapped RAM. An access that stays
+ * in the page must be fast; one that crosses into page 0x11 must be fast
+ * exactly when XR_GUEST_FAST_PAGE_CROSS is 1 (never one wide access across
+ * the page on hosts where that traps, the Xbox 360). Bus `a` is current. */
+static void page_cross_path()
+{
+    static uint8_t decoy[0x2000];
+    uint8_t *const saved = xr_guest_fast_page[0x10];
+    unsigned wrong = 0, wrong_value = 0, n = 0;
+    for (unsigned width = 2; width <= 8; width *= 2) {
+        for (uint32_t off = 0x1000 - width - 3; off < 0x1000; ++off) {
+            const uint32_t va = 0x10000 + off;
+            const int crosses = off + width > 0x1000;
+            const int want_fast = !crosses || XR_GUEST_FAST_PAGE_CROSS;
+            fill(&s_mem[0]);
+            for (unsigned i = 0; i < sizeof decoy; ++i) decoy[i] = (uint8_t)(0xD0 ^ i);
+            xr_guest_fast_page[0x10] = decoy;
+            const uint8_t *src = want_fast ? decoy + off : s_mem[0].low + off;
+            uint64_t want = 0;
+            for (unsigned i = 0; i < width; ++i) want |= (uint64_t)src[i] << (8 * i);
+            uint64_t got = width == 2 ? (uint64_t)(uint16_t)XrGuestRef<uint16_t>(va)
+                         : width == 4 ? (uint64_t)(uint32_t)XrGuestRef<uint32_t>(va)
+                                      : (uint64_t)XrGuestRef<uint64_t>(va);
+            if (got != want) ++wrong_value;
+            if ((xr_guest_fast_ptr(va, width) != 0) != want_fast) ++wrong;
+            /* store: exactly the expected buffer changes */
+            const uint64_t v = 0x0123456789ABCDEFull;
+            const uint8_t *dst = want_fast ? decoy + off : s_mem[0].low + off;
+            const uint8_t *other = want_fast ? s_mem[0].low + off : decoy + off;
+            uint8_t other_before[8];
+            memcpy(other_before, other, width);
+            if (width == 2) (XrGuestRef<uint16_t>(va)) = (uint16_t)v;
+            else if (width == 4) (XrGuestRef<uint32_t>(va)) = (uint32_t)v;
+            else (XrGuestRef<uint64_t>(va)) = v;
+            for (unsigned i = 0; i < width; ++i)
+                if (dst[i] != (uint8_t)(v >> (8 * i))) ++wrong_value;
+            if (memcmp(other, other_before, width)) ++wrong_value;
+            ++n;
+        }
+    }
+    /* 16 bytes (XMM_MEM/XMM_STORE resolve all of them with one lookup) */
+    xr_guest_fast_page[0x10] = decoy;
+    if (!xr_guest_fast_ptr(0x10ff0, 16)) ++wrong;
+    if ((xr_guest_fast_ptr(0x10ff1, 16) != 0) != (XR_GUEST_FAST_PAGE_CROSS != 0)) ++wrong;
+    if ((xr_guest_fast_ptr(0x10ffc, 16) != 0) != (XR_GUEST_FAST_PAGE_CROSS != 0)) ++wrong;
+    if (!xr_guest_fast_ptr(0x10fff, 1)) ++wrong;
+    xr_guest_fast_page[0x10] = saved;
+    check("page-crossing accesses take the path XR_GUEST_FAST_PAGE_CROSS selects", n == 23 && wrong == 0);
+    check("page-crossing accesses read and write the right bytes", wrong_value == 0);
+    if (wrong || wrong_value) fprintf(stderr, "  page cross: %u wrong path, %u wrong values\n", wrong, wrong_value);
+}
+
 int main()
 {
     static XrGuestBus a, a_twin, other;
@@ -186,6 +240,7 @@ int main()
     check("alias reads the same RAM", (uint32_t)XrGuestRef<uint32_t>(0x80010ffc) == 0x12233445u);
     (XrGuestRef<uint16_t>(0x10fff)) = 0xA1B2;   /* crosses into the next page, same mapping */
     check("page-crossing store", s_mem[0].low[0xfff] == 0xB2 && s_mem[0].low[0x1000] == 0xA1);
+    page_cross_path();
 
     /* Another bus on this thread: never the table. */
     xr_guest_bus_init(&other);
@@ -230,7 +285,8 @@ int main()
           !xr_guest_fast_page[0x28] && !xr_guest_fast_page[0x29]);
     g_recomp_guest_bus = &other;
     other_ram[0xffe] = 0x11; other_ram[0xfff] = 0x22; other_ram[0x1000] = 0x33; other_ram[0x1001] = 0x44;
-    check("fast access reaching into the next page", xr_guest_fast_ptr(0x20ffe, 4) &&
+    check("access reaching into the next page", (XR_GUEST_FAST_PAGE_CROSS ? xr_guest_fast_ptr(0x20ffe, 4) != 0
+                                                                           : xr_guest_fast_ptr(0x20ffe, 4) == 0) &&
           (uint32_t)XrGuestRef<uint32_t>(0x20ffe) == 0x44332211u);
     check("slow access at a listed page's neighbour", !xr_guest_fast_ptr(0x21ffe, 4) &&
           (uint32_t)XrGuestRef<uint16_t>(0x21ffe) == (uint32_t)(other_ram[0x1ffe] | other_ram[0x1fff] << 8));
