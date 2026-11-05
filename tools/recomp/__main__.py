@@ -89,10 +89,11 @@ def _load_addrs(path):
 def _resolve_reg_cache(choice, explicit_guest_bus):
     """--reg-cache auto/off/gpr/full -> the level the translator uses.
 
-    auto is off for now: the cached output is opt-in until it has been
-    compared against the uncached build on a real run."""
+    auto is full for the explicit guest bus, the big-endian (Xbox 360)
+    target, where TLS register traffic is the dominant cost, and off for
+    the desktop build, whose output stays as it was."""
     if choice == "auto":
-        return "off"
+        return "full" if explicit_guest_bus else "off"
     return choice
 
 
@@ -318,8 +319,9 @@ def main():
                              "of the TLS globals, spilled and refilled around "
                              "calls and returns (recomp_types.h, "
                              "RECOMP_REG_CACHE). gpr: eax..edi; full: also "
-                             "mm0-7 and xmm0-7; off: unchanged output. auto "
-                             "is currently off. -DRECOMP_REG_CACHE_OFF "
+                             "mm0-7 and xmm0-7; off: unchanged output. auto: "
+                             "full with --explicit-guest-bus, else off. "
+                             "-DRECOMP_REG_CACHE_OFF "
                              "compiles cached output with the globals")
     parser.add_argument("--reg-cache-exclude", metavar="VA[,VA...]|@FILE",
                         help="Functions emitted uncached under --reg-cache "

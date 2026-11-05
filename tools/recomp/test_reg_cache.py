@@ -457,6 +457,15 @@ def test_diffcheck_fixture():
         assert not regcache_diffcheck.compare(off, on, out=io.StringIO())
 
 
+def test_auto_level():
+    from tools.recomp.__main__ import _resolve_reg_cache, _parse_va_list
+    assert _resolve_reg_cache("auto", True) == "full"
+    assert _resolve_reg_cache("auto", False) == "off"
+    assert _resolve_reg_cache("gpr", True) == "gpr"
+    assert _resolve_reg_cache("off", True) == "off"
+    assert _parse_va_list("0x11000, 2CD892") == {0x11000, 0x2CD892}
+
+
 # 11. compile and run --------------------------------------------------------
 
 def test_conformance_corpus_with_the_cache():
