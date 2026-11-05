@@ -4,7 +4,11 @@
 #   x86 flat          -- the desktop memory model, also checked against the CPU
 #   x64 explicit-bus  -- no MMX intrinsics on x64; hashes only
 #   x64 flat
-# All four must print identical case hashes; the x86 explicit-bus output is the
+#   x86/x64 shift     -- explicit bus with RECOMP_MMX_SHIFT_LANES=1 and
+#                        RECOMP_XMM_SCALAR_PROXY=1, the helper variants the
+#                        big-endian build uses, checked against the CPU on x86
+#                        like the others
+# All six must print identical case hashes; the x86 explicit-bus output is the
 # golden file the big-endian (Xbox 360) run is compared against
 # (compare.py). Outputs go to -OutDir (default build\simd_lanes).
 [CmdletBinding()]
@@ -27,12 +31,12 @@ $common = "/nologo /EHsc /O2 /W3 /DSIMD_LANES_MAIN /I`"$TypesDir`" /I`"$root\src
 $bus = "`"$root\src\platform\recomp_guest_bus.c`""
 $failed = 0
 foreach ($arch in @('x86', 'x64')) {
-    foreach ($mode in @('explicit', 'flat')) {
+    foreach ($mode in @('explicit', 'flat', 'shift')) {
         $name = "simd_lanes_${arch}_$mode"
         $exe = Join-Path $OutDir "$name.exe"
         $objDir = Join-Path $OutDir "$name.obj"
         New-Item -ItemType Directory -Force $objDir | Out-Null
-        $defs = if ($mode -eq 'flat') { '/DSIMD_LANES_FLAT' } else { '' }
+        $defs = if ($mode -eq 'flat') { '/DSIMD_LANES_FLAT' } elseif ($mode -eq 'shift') { '/DRECOMP_MMX_SHIFT_LANES=1 /DRECOMP_XMM_SCALAR_PROXY=1' } else { '' }
         $extra = if ($mode -eq 'flat') { '' } else { $bus }
         $cmd = "`"$vcvars`" $arch >nul && cl $common $defs /Fo`"$objDir\\`" /Fe`"$exe`" `"$src`" $extra"
         $ErrorActionPreference = 'Continue'

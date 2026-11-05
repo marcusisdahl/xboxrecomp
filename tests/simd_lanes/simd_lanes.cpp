@@ -150,7 +150,13 @@ R_XMM2(XMM_UNPACK_LOW) R_XMM2(XMM_UNPACK_HIGH)
 R_XMM2(XMM_MOVE_LOW_TO_HIGH) R_XMM2(XMM_MOVE_HIGH_TO_LOW)
 
 static void r_XMM_ZERO(const Ctx *) { XMM_STORE(VA_OUT, XMM_ZERO()); }
-static void r_XMM_SCALAR(const Ctx *) { XMM_STORE(VA_OUT, XMM_SCALAR(MEMF(VA_A))); }
+/* Assigned over a register holding other data, as generated code does
+ * (xmmN = XMM_SCALAR(...)): lanes 1-3 must come out zero. */
+static void r_XMM_SCALAR(const Ctx *) {
+    RecompXmm t = XMM_MEM(VA_B);
+    t = XMM_SCALAR(MEMF(VA_A));
+    XMM_STORE(VA_OUT, t);
+}
 static void r_XMM_SCALAR_DOUBLE(const Ctx *) { XMM_STORE(VA_OUT, XMM_SCALAR_DOUBLE(MEMD(VA_A))); }
 static void r_XMM_SCALAR_BITS(const Ctx *) { XMM_STORE(VA_OUT, XMM_SCALAR_BITS(MEM32(VA_A))); }
 static void r_XMM_MEM_STORE(const Ctx *c) { XMM_STORE(VA_OUT, XMM_MEM(VA_A + (c->imm & 15u))); }
