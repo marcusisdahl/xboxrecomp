@@ -205,5 +205,29 @@ class CvtPi2PsTest(unittest.TestCase):
         self.assertFalse(statement.lstrip().startswith("/*"), statement)
 
 
+class ScalarFloatToIntTest(unittest.TestCase):
+    """cvtss2si rounds by MXCSR (nearest-even) and cvttss2si truncates; both
+    give 0x80000000 for NaN and out of range. They were lifted as a C cast,
+    which truncates both and is undefined out of range."""
+
+    def _lift(self, m, dst, src):
+        return Lifter().lift_instruction(_insn(m, "", [dst, src]))
+
+    def test_cvtss2si_rounds_through_the_lane_conversion(self):
+        self.assertEqual(
+            self._lift("cvtss2si", Operand(type="reg", reg="eax"), _xmm("xmm0")),
+            ["eax = (uint32_t)MMX_CVT_F2I(xmm0.f[0], 0); /* cvtss2si */"])
+
+    def test_cvttss2si_truncates_through_the_lane_conversion(self):
+        self.assertEqual(
+            self._lift("cvttss2si", Operand(type="reg", reg="ecx"), _mem("esp", 8, size=4)),
+            ["ecx = (uint32_t)MMX_CVT_F2I(MEMF(esp + 8), 1); /* cvttss2si */"])
+
+    def test_no_plain_cast_is_left(self):
+        for m in ("cvtss2si", "cvttss2si"):
+            out = self._lift(m, Operand(type="reg", reg="edx"), _xmm("xmm3"))[0]
+            self.assertNotIn("(int32_t)xmm3", out)
+
+
 if __name__ == "__main__":
     unittest.main()

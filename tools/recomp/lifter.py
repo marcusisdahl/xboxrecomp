@@ -3538,8 +3538,17 @@ class Lifter:
                 src = _fmt_operand_read(ops[1])
                 return [_sse_write(ops[0], f"(float)(int32_t){src}") + " /* cvtsi2ss */"]
         if m in ("cvtss2si", "cvttss2si"):
+            # cvtss2si rounds by MXCSR (nearest-even: titles leave it at
+            # the default, as the cvtps2pi lifting assumes) and cvttss2si
+            # truncates; both give 0x80000000 for NaN and out of range. A
+            # C cast truncates either way, and out of range it is undefined
+            # (0x7FFFFFFF or a saturated value on PowerPC). MMX_CVT_F2I is
+            # the cvtps2pi lane conversion, which does exactly this.
             if nops >= 2:
-                return [_fmt_operand_write(ops[0], f"(int32_t){_sse_read(ops[1])}") + f" /* {m} */"]
+                trunc = "1" if m == "cvttss2si" else "0"
+                return [_fmt_operand_write(
+                    ops[0], f"(uint32_t)MMX_CVT_F2I({_sse_read(ops[1])}, {trunc})")
+                    + f" /* {m} */"]
         if m == "cvtsi2sd":
             if nops >= 2:
                 src = _fmt_operand_read(ops[1])
