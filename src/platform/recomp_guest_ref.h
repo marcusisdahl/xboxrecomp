@@ -258,17 +258,20 @@ public:
         xr_guest_ref_store_fn<sizeof(T)>(address, XrGuestCodec<T>::encode(value));
         return value;
     }
-    T operator=(const XrGuestRef &other) { return *this = (T)other; }
-    template<class U> T operator=(U value) { return *this = (T)value; }
-    T operator+=(T n) { return *this = XrGuestMath<T>::add((T)*this, n); }
-    T operator-=(T n) { return *this = XrGuestMath<T>::sub((T)*this, n); }
-    T operator|=(T n) { return *this = (T)((T)*this | n); }
-    T operator&=(T n) { return *this = (T)((T)*this & n); }
-    T operator^=(T n) { return *this = (T)((T)*this ^ n); }
-    T operator++() { return *this += (T)1; }
-    T operator--() { return *this -= (T)1; }
-    T operator++(int) { T old = *this; *this += (T)1; return old; }
-    T operator--(int) { T old = *this; *this -= (T)1; return old; }
+    /* The forwarding operators are forced inline too: left to the compiler,
+     * the Xbox 360 build kept some as out-of-line calls in big functions
+     * (a call that only forwards to the inline load and store). */
+    XR_REF_INLINE T operator=(const XrGuestRef &other) { return *this = (T)other; }
+    template<class U> XR_REF_INLINE T operator=(U value) { return *this = (T)value; }
+    XR_REF_INLINE T operator+=(T n) { return *this = XrGuestMath<T>::add((T)*this, n); }
+    XR_REF_INLINE T operator-=(T n) { return *this = XrGuestMath<T>::sub((T)*this, n); }
+    XR_REF_INLINE T operator|=(T n) { return *this = (T)((T)*this | n); }
+    XR_REF_INLINE T operator&=(T n) { return *this = (T)((T)*this & n); }
+    XR_REF_INLINE T operator^=(T n) { return *this = (T)((T)*this ^ n); }
+    XR_REF_INLINE T operator++() { return *this += (T)1; }
+    XR_REF_INLINE T operator--() { return *this -= (T)1; }
+    XR_REF_INLINE T operator++(int) { T old = *this; *this += (T)1; return old; }
+    XR_REF_INLINE T operator--(int) { T old = *this; *this -= (T)1; return old; }
 };
 
 #define XR_MEM8(a) XrGuestRef<uint8_t>((uint32_t)(a))

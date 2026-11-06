@@ -307,8 +307,26 @@ extern RECOMP_TLS uint16_t g_fp_cc;
  * PC narrows the significand only; the exponent keeps the register's range.
  * So a plain (float) cast is right only inside float's range -- outside it,
  * it would turn a large intermediate into inf (and inf*0 into NaN) or flush a
- * tiny one to 0, where the x87 carries on. Those go the long way. */
-static inline double recomp_fp_round24(double x) {
+ * tiny one to 0, where the x87 carries on. Those go the long way.
+ *
+ * Every x87 arithmetic result goes through RECOMP_FP_PC (4,677 sites in
+ * Burnout 3), so the common case is forced inline: |x| in float's normal
+ * range is one frsp after two independent compares (NaN fails both), zero
+ * returns as it is, and only the rest (NaN, inf, out of float range) calls
+ * the out-of-line body -- the same results as before for every input. Out
+ * of line, the Xbox 360 compiler called the whole function at every site
+ * (a stack frame and a load-hit-store per x87 operation). */
+#if defined(_MSC_VER)
+#define RECOMP_HOT_INLINE static __forceinline
+#define RECOMP_COLD static inline __declspec(noinline)
+#elif defined(__GNUC__)
+#define RECOMP_HOT_INLINE static inline __attribute__((always_inline))
+#define RECOMP_COLD static inline __attribute__((noinline))
+#else
+#define RECOMP_HOT_INLINE static inline
+#define RECOMP_COLD static inline
+#endif
+RECOMP_COLD double recomp_fp_round24_slow(double x) {
     double ax = fabs(x);
     int e;
     if ((ax <= 3.4028234663852886e38 && ax >= 1.1754943508222875e-38) || ax == 0.0
@@ -317,7 +335,17 @@ static inline double recomp_fp_round24(double x) {
     x = frexp(x, &e);                      /* |x| in [0.5, 1): float-exact range */
     return ldexp((double)(float)x, e);
 }
-#define RECOMP_FP_PC(x) ((g_fp_control_word & 0x300u) ? (double)(x) : recomp_fp_round24(x))
+RECOMP_HOT_INLINE double recomp_fp_round24(double x) {
+    double ax = fabs(x);
+    if (ax <= 3.4028234663852886e38 && ax >= 1.1754943508222875e-38)
+        return (double)(float)x;
+    if (ax == 0.0) return x;               /* the signed zero (double)(float)x gives */
+    return recomp_fp_round24_slow(x);
+}
+RECOMP_HOT_INLINE double recomp_fp_pc(double x) {
+    return (g_fp_control_word & 0x300u) ? x : recomp_fp_round24(x);
+}
+#define RECOMP_FP_PC(x) recomp_fp_pc((double)(x))
 #define RECOMP_FCMP_CC(c) ((uint16_t)((c)==2 ? 0x4500u : (c)<0 ? 0x0100u : (c)>0 ? 0u : 0x4000u))
 /* Values in the existing double-backed stack are all representable as normal
  * x87 extended values, including binary64 subnormals. Empty stack tags and
@@ -477,7 +505,15 @@ static inline int recomp_x87_fptan(double *st0, double *push, uint16_t *cc) {
 #else
 #define RECOMP_X87_ROUND_FPR 0
 #endif
-static inline double recomp_x87_round(double value, uint16_t control) {
+/* Forced inline on the Xbox 360, where the compiler kept it (and
+ * recomp_fist) out of line: a call, a frame and a load-hit-store on the
+ * saved link register per FIST. Other hosts keep plain inline. */
+#if RECOMP_X87_ROUND_FPR
+#define RECOMP_X87_INLINE RECOMP_HOT_INLINE
+#else
+#define RECOMP_X87_INLINE static inline
+#endif
+RECOMP_X87_INLINE double recomp_x87_round(double value, uint16_t control) {
     double t, lo, fraction;
     if (!(fabs(value) < 4503599627370496.0)) return value;   /* 2^52, inf, NaN */
 #if RECOMP_X87_ROUND_FPR
@@ -516,7 +552,12 @@ static inline double recomp_frndint(double value, uint16_t control) {
 }
 /* x87 integer stores use the guest RC bits, independently of host rounding.
  * Masked invalid conversions store the signed integer-indefinite value. */
-static inline int64_t recomp_fist(double value, uint16_t control, unsigned bits) {
+#if RECOMP_X87_ROUND_FPR
+RECOMP_COLD int64_t recomp_fist_slow(double value, uint16_t control, unsigned bits)
+#else
+static inline int64_t recomp_fist(double value, uint16_t control, unsigned bits)
+#endif
+{
     double rounded = recomp_x87_round(value, control);
     double limit = bits == 32 ? 2147483648.0 : bits == 16 ? 32768.0 :
                    bits == 64 ? 9223372036854775808.0 : ldexp(1.0, (int)bits - 1);
@@ -524,6 +565,23 @@ static inline int64_t recomp_fist(double value, uint16_t control, unsigned bits)
         return bits==64?INT64_MIN:-(INT64_C(1)<<(bits-1));
     return (int64_t)rounded;
 }
+#if RECOMP_X87_ROUND_FPR
+/* Xbox 360: the 16- and 32-bit stores (all but a handful of FIST sites)
+ * inline, converting through a 32-bit integer; every value they return,
+ * the indefinite one included, is the sign extension of its low word, so no
+ * wide 64-bit constant is built at the call site (the 2010-01 compiler can
+ * fold those with a wrong top half). 64-bit stores stay out of line. */
+RECOMP_HOT_INLINE int64_t recomp_fist(double value, uint16_t control, unsigned bits) {
+    if (bits == 32 || bits == 16) {
+        double rounded = recomp_x87_round(value, control);
+        double limit = bits == 32 ? 2147483648.0 : 32768.0;
+        if (rounded >= -limit && rounded < limit)              /* not NaN */
+            return (int64_t)(int32_t)rounded;
+        return bits == 32 ? (int64_t)(-2147483647 - 1) : (int64_t)-32768;
+    }
+    return recomp_fist_slow(value, control, bits);
+}
+#endif
 
 /* ================================================================
  * ICALL trace ring buffer (for debugging indirect calls)
@@ -1651,6 +1709,28 @@ static inline RecompMmx MMX_ZERO(void) { RecompMmx r; r.q = 0; return r; }
 /* CVTPS2PI follows MXCSR; CVTTPS2PI truncates regardless of its rounding mode.
  * Use SSE scalar conversions to avoid touching the host x87/MMX register file.
  * Non-x86 hosts use their floating-point environment for rounding instead. */
+#if defined(_XBOX) && !defined(_M_IX86) && !defined(_M_X64)
+/* Xbox 360: fctiw/fctiwz in the FPR, inline. fctiw rounds by FPSCR[RN],
+ * which is nearest-even on this host and never changed (the game host
+ * checks it at start-up). PPC saturates +overflow to 0x7FFFFFFF where x86
+ * returns 0x80000000 for every invalid case, so values >= 2^31 are steered
+ * to -2^31 first with fsel (NaN and -overflow already give 0x80000000).
+ * The integer leaves the FPR with stfiwx: one load-hit-store, no compares
+ * or branches (the generic path below was a call per lane with nine FP
+ * compares, and the XMV player's colour converter runs 12 per 4 pixels). */
+RECOMP_HOT_INLINE double recomp_f2i_fpr(float v, int truncate)
+{
+    double d = (double)v;
+    d = __fsel(d - 2147483648.0, -2147483648.0, d);
+    return truncate ? __fctiwz(d) : __fctiw(d);
+}
+RECOMP_HOT_INLINE int32_t MMX_CVT_F2I(float v, int truncate)
+{
+    __declspec(align(8)) int32_t t[2];
+    __stfiwx(recomp_f2i_fpr(v, truncate), 0, t);
+    return t[0];
+}
+#else
 static inline int32_t MMX_CVT_F2I(float v, int truncate)
 {
 #if defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__)
@@ -1667,6 +1747,7 @@ static inline int32_t MMX_CVT_F2I(float v, int truncate)
     return (int32_t)rounded;
 #endif
 }
+#endif
 
 /* MMX lane access by shifting `q`, not through the union views.
  *
@@ -1707,6 +1788,17 @@ static inline int32_t MMX_CVT_F2I(float v, int truncate)
 RECOMP_MQ_FN RecompMmx recomp_mmx_q(uint64_t q) { RecompMmx r; r.q = q; return r; }
 #endif
 
+#if defined(_XBOX) && !defined(_M_IX86) && !defined(_M_X64)
+/* Both lanes leave the FPRs through one 8-byte slot: two stfiwx, one ld,
+ * one load-hit-store instead of two. Big-endian: the high word is first. */
+RECOMP_HOT_INLINE RecompMmx MMX_FROM_PS(float lo, float hi, int truncate)
+{
+    __declspec(align(8)) uint64_t t;
+    __stfiwx(recomp_f2i_fpr(hi, truncate), 0, &t);
+    __stfiwx(recomp_f2i_fpr(lo, truncate), 4, &t);
+    return recomp_mmx_q(t);
+}
+#else
 static inline RecompMmx MMX_FROM_PS(float lo, float hi, int truncate)
 {
 #if RECOMP_MMX_SHIFT_LANES
@@ -1719,6 +1811,7 @@ static inline RecompMmx MMX_FROM_PS(float lo, float hi, int truncate)
     return r;
 #endif
 }
+#endif
 
 /** cvtpi2ps: two signed dwords in, two singles out, into the LOW half of the
  * destination -- lanes 2 and 3 keep whatever they held. That detail is the

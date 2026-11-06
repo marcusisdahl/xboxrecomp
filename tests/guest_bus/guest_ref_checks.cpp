@@ -247,6 +247,10 @@ int main()
     check("other bus maps", xr_guest_map_ram(&other, 0x10000, 0x2000, other_ram, 3) == XR_GUEST_OK);
     check("owner unchanged", xr_guest_fast_bus == &a);
     other_ram[0x10] = 0x5A;
+#if !defined(XR_GUEST_FAST_ONE_BUS)
+    /* XR_GUEST_FAST_ONE_BUS drops the per-access bus test: a thread with
+     * another bus, or none, then reaches the table owner's RAM by design,
+     * so these checks only hold without it. */
     g_recomp_guest_bus = &other;
     uint8_t b = 0;
     check("other bus reads its own RAM", ref_load<uint8_t>(0x10010, &b) == XR_GUEST_OK && b == 0x5A);
@@ -254,6 +258,7 @@ int main()
     g_recomp_guest_bus = NULL;
     check("no bus faults", ref_load<uint8_t>(0x10010, &b) == XR_GUEST_ARGUMENT);
     check("no bus store faults", ref_store<uint32_t>(0x10010, 0) == XR_GUEST_ARGUMENT);
+#endif
 
     /* Ownership moves. */
     xr_guest_fast_select(&other);
@@ -262,9 +267,11 @@ int main()
     g_recomp_guest_bus = &a;
     fill(&s_mem[0]);
     uint32_t w = 0;
+#if !defined(XR_GUEST_FAST_ONE_BUS)
     check("old owner still correct off the table",
           ref_load<uint32_t>(0x10000, &w) == XR_GUEST_OK && w == (uint32_t)(s_mem[0].low[0] | s_mem[0].low[1] << 8 |
                                                                            s_mem[0].low[2] << 16 | (uint32_t)s_mem[0].low[3] << 24));
+#endif
     xr_guest_bus_init(&other);
     check("init releases the table", xr_guest_fast_bus == NULL && !xr_guest_fast_page[0x10] && !xr_guest_fast_page[0x11]);
     check("next RAM map takes it", xr_guest_map_ram(&other, 0x20000, 0x1000, other_ram, 3) == XR_GUEST_OK &&
