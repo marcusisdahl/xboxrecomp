@@ -599,6 +599,16 @@ extern volatile uint32_t g_icall_trace_idx;
 /** Total count of indirect calls executed. */
 extern volatile uint64_t g_icall_count;
 
+/* Each indirect call records its target in the ring above (two volatile
+ * stores). RECOMP_NO_ICALL_TRACE drops that for builds that never read the
+ * ring; g_icall_count, which hosts report as a rate, is kept either way. */
+#if defined(RECOMP_NO_ICALL_TRACE)
+#define RECOMP_ICALL_TRACE_NOTE(va) ((void)0)
+#else
+#define RECOMP_ICALL_TRACE_NOTE(va) \
+    (g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = (va), (void)g_icall_trace_idx++)
+#endif
+
 /**
  * Called when an indirect call target cannot be resolved.
  * Implement this in your game-specific code to log diagnostics.
@@ -980,6 +990,14 @@ XR_REF_NOINLINE inline void recomp_xmm_store_slow(uint32_t addr, RecompXmm v) {
 /* XR_GUEST_REF_OUTLINE (recomp_guest_ref.h) keeps these out of line too. */
 #if defined(XR_GUEST_REF_OUTLINE)
 #define RECOMP_XMM_MEM_FN XR_REF_NOINLINE inline
+#elif defined(RECOMP_XMM_MEM_FORCE_INLINE)
+/* Opt-in: the fast path inline at every site. Plain `inline` leaves it to
+ * the compiler, and the Xbox 360 one called XMM_MEM out of line (7% of the
+ * game-code samples of a console race, a call and a frame per movaps).
+ * Forcing it costs compile time on the largest functions, as forcing the
+ * scalar accessors did (recomp_guest_ref.h), so measure the game-library
+ * build before turning it on. */
+#define RECOMP_XMM_MEM_FN static XR_REF_INLINE
 #else
 #define RECOMP_XMM_MEM_FN static inline
 #endif
@@ -1489,8 +1507,7 @@ extern volatile uint64_t g_icall_guard_misses;
  */
 #define RECOMP_ICALL(xbox_va) do { \
     uint32_t _va = (uint32_t)(xbox_va); \
-    g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = _va; \
-    g_icall_trace_idx++; \
+    RECOMP_ICALL_TRACE_NOTE(_va); \
     g_icall_count++; \
     /* Skip garbage VAs outside code section + kernel thunk range */ \
     if (!RECOMP_ICALL_IS_CODE(_va)) { \
@@ -1516,8 +1533,7 @@ extern volatile uint64_t g_icall_guard_misses;
  */
 #define RECOMP_ICALL_SAFE(xbox_va, saved_esp) do { \
     uint32_t _va = (uint32_t)(xbox_va); \
-    g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = _va; \
-    g_icall_trace_idx++; \
+    RECOMP_ICALL_TRACE_NOTE(_va); \
     g_icall_count++; \
     if (!RECOMP_ICALL_IS_CODE(_va)) { \
         recomp_icall_not_code_log(_va); \
@@ -1542,8 +1558,7 @@ extern volatile uint64_t g_icall_guard_misses;
  */
 #define RECOMP_ICALL_SAFE_AT(xbox_va, saved_esp, site) do { \
     uint32_t _va = (uint32_t)(xbox_va); \
-    g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = _va; \
-    g_icall_trace_idx++; \
+    RECOMP_ICALL_TRACE_NOTE(_va); \
     g_icall_count++; \
     if (!RECOMP_ICALL_IS_CODE(_va)) { \
         recomp_icall_not_code_log(_va); \
